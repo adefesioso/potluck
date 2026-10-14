@@ -34,6 +34,7 @@ impl Peer {
     fn spawn(dir: &Path, args: &[&str]) -> Self {
         let mut child = potluck(dir)
             .args(args)
+            .args(["--api", "127.0.0.1:0"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

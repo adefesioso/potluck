@@ -47,6 +47,12 @@ pub enum Event {
         text: String,
         nonce: u64,
     },
+    Heartbeat {
+        room: String,
+        ts: u64,
+        models: Vec<String>,
+        busy: u32,
+    },
 }
 
 /// A JSON event body signed by `by`. Its id is the hash of the exact body bytes.
@@ -111,6 +117,26 @@ pub struct Room {
     pub events: BTreeMap<String, Signed>,
     /// Known addresses, each ending in /p2p/<peer>.
     pub peers: BTreeSet<Multiaddr>,
+    #[serde(default)]
+    pub local: Local,
+}
+
+/// This node's private settings for the room; never synced.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Local {
+    pub shares: BTreeMap<String, Share>,
+    pub pinned: BTreeSet<PeerId>,
+    pub blocked: BTreeSet<PeerId>,
+    /// App name -> endpoint bearer token.
+    pub tokens: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Share {
+    pub backend: String,
+    pub max_concurrent: u32,
+    pub per_min: u32,
+    pub max_tokens: Option<u64>,
 }
 
 impl Room {
@@ -136,6 +162,7 @@ impl Room {
             id: id.clone(),
             events: BTreeMap::from([(id, genesis)]),
             peers: BTreeSet::new(),
+            local: Local::default(),
         })
     }
 
@@ -185,7 +212,9 @@ impl Room {
                     "invite is for someone else"
                 );
             }
-            Event::Genesis { .. } | Event::Chat { .. } => bail!("not a room event"),
+            Event::Genesis { .. } | Event::Chat { .. } | Event::Heartbeat { .. } => {
+                bail!("not a room event")
+            }
         }
         Ok(())
     }

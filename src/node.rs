@@ -1,11 +1,14 @@
 //! Room node: keeps connections to members, merges events, floods chat, runs the REPL.
 
+mod infer;
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -25,7 +28,7 @@ use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
 use crate::{
     net::Behaviour,
-    room::{Event, Room, Signed, Ticket, nonce, now},
+    room::{Event, Room, Share, Signed, Ticket, nonce, now},
 };
 
 const PROTOCOL: StreamProtocol = StreamProtocol::new("/potluck/room/1");
@@ -41,8 +44,8 @@ enum Msg {
         events: Vec<Signed>,
         peers: Vec<Multiaddr>,
     },
-    Chat {
-        chat: Signed,
+    Cast {
+        signed: Signed,
     },
     Denied {
         reason: String,
@@ -146,17 +149,22 @@ struct State {
     online: HashSet<PeerId>,
     /// Our own listen addresses.
     addrs: BTreeSet<Multiaddr>,
-    /// Chat ids already delivered, for flood dedup.
-    // ponytail: grows for the life of the process; prune by age if sessions run for weeks.
-    seen: HashSet<String>,
+    /// Chat and heartbeat ids already delivered, for flood dedup; pruned after 10 min.
+    seen: HashMap<String, Instant>,
+    beats: HashMap<PeerId, infer::Beat>,
+    /// Provider side: requests running per shared model, recent requests per member.
+    inflight: HashMap<String, u32>,
+    hits: HashMap<PeerId, Vec<Instant>>,
 }
 
 struct Node {
     key: Keypair,
     me: PeerId,
     path: PathBuf,
+    log_path: PathBuf,
     control: Control,
     cmds: mpsc::UnboundedSender<Cmd>,
+    http: reqwest::Client,
     state: Mutex<State>,
 }
 
@@ -253,27 +261,55 @@ impl Node {
         });
     }
 
-    /// Delivers a chat message once and forwards it to every other online member.
-    fn chat(self: &Arc<Self>, from: PeerId, chat: Signed) {
+    /// Delivers a chat message or heartbeat once and forwards it to every other online member.
+    fn cast(self: &Arc<Self>, from: PeerId, signed: Signed) {
         let st = &mut *self.lock();
-        let Ok(Event::Chat { room, text, .. }) = chat.open() else {
+        let Ok(event) = signed.open() else { return };
+        let Some(nick) = st.room.members().get(&signed.by).cloned() else {
             return;
         };
-        let Some(nick) = st.room.members().get(&chat.by).cloned() else {
+        let (Event::Chat { room, .. } | Event::Heartbeat { room, .. }) = &event else {
             return;
         };
-        if room != st.room.id || !st.seen.insert(chat.id()) {
+        if *room != st.room.id || st.seen.insert(signed.id(), Instant::now()).is_some() {
             return;
         }
-        if chat.by != self.me {
-            println!("<{nick}> {text}");
+        match event {
+            Event::Chat { text, .. } if signed.by != self.me => println!("<{nick}> {text}"),
+            Event::Heartbeat {
+                ts, models, busy, ..
+            } if signed.by != self.me => Self::on_beat(st, signed.by, ts, models, busy),
+            _ => {}
         }
         for p in self.online_members(st) {
-            if p != from && p != chat.by {
-                let (control, msg) = (self.control.clone(), Msg::Chat { chat: chat.clone() });
+            if p != from && p != signed.by {
+                let (control, msg) = (
+                    self.control.clone(),
+                    Msg::Cast {
+                        signed: signed.clone(),
+                    },
+                );
                 tokio::spawn(async move { send(control, p, &msg).await });
             }
         }
+    }
+
+    fn member(st: &State, who: &str) -> Result<PeerId> {
+        let members = st.room.members();
+        let found = members
+            .iter()
+            .find(|(p, n)| *n == who || p.to_string() == who);
+        Ok(*found.context("no such member")?.0)
+    }
+
+    /// Toggles `who` in a local peer set; returns whether it's now in.
+    fn toggle(&self, who: &str, set: impl Fn(&mut State) -> &mut BTreeSet<PeerId>) -> Result<bool> {
+        let st = &mut *self.lock();
+        let peer = Self::member(st, who)?;
+        let set = set(st);
+        let on = set.insert(peer) || !set.remove(&peer);
+        self.save(st);
+        Ok(on)
     }
 
     fn admit(self: &Arc<Self>, peer: PeerId, join: Signed) -> Result<Msg> {
@@ -296,13 +332,13 @@ impl Node {
                     reason: format!("{e:#}"),
                 }))
             }
-            Some(Msg::Sync { .. } | Msg::Chat { .. }) if !member => denied("not a member"),
+            Some(Msg::Sync { .. } | Msg::Cast { .. }) if !member => denied("not a member"),
             Some(Msg::Sync { events, peers }) => {
                 self.merge(Some(peer), events, peers);
                 Some(self.sync_msg(&self.lock()))
             }
-            Some(Msg::Chat { chat }) => {
-                self.chat(peer, chat);
+            Some(Msg::Cast { signed }) => {
+                self.cast(peer, signed);
                 None
             }
             _ => None,
@@ -384,15 +420,71 @@ impl Node {
                 let who = words.next().context("usage: /remove <nick|peer-id>")?;
                 let removes = {
                     let st = self.lock();
-                    let members = st.room.members();
-                    let peer = members
-                        .iter()
-                        .find(|(p, n)| *n == who || p.to_string() == who);
-                    let (peer, _) = peer.context("no such member")?;
-                    ensure!(*peer != self.me, "can't remove yourself");
-                    st.room.remove(&self.key, peer)?
+                    let peer = Self::member(&st, who)?;
+                    ensure!(peer != self.me, "can't remove yourself");
+                    st.room.remove(&self.key, &peer)?
                 };
                 self.merge(None, removes, vec![]);
+            }
+            Some("/share") => {
+                let usage =
+                    "usage: /share <model> <backend-url> [max_concurrent] [per_min] [max_tokens]";
+                let model = words.next().context(usage)?.to_owned();
+                let backend = words.next().context(usage)?.to_owned();
+                let share = Share {
+                    backend,
+                    max_concurrent: words.next().map(str::parse).transpose()?.unwrap_or(1),
+                    per_min: words.next().map(str::parse).transpose()?.unwrap_or(30),
+                    max_tokens: words.next().map(str::parse).transpose()?,
+                };
+                let st = &mut *self.lock();
+                st.room.local.shares.insert(model.clone(), share);
+                self.save(st);
+                println!("* sharing {model}");
+            }
+            Some("/unshare") => {
+                let model = words.next().context("usage: /unshare <model>")?;
+                let st = &mut *self.lock();
+                st.room.local.shares.remove(model).context("not shared")?;
+                self.save(st);
+                println!("* unshared {model}");
+            }
+            Some("/models") => {
+                let models = self.online_models();
+                if models.is_empty() {
+                    println!("* no models online");
+                }
+                for (model, providers) in models {
+                    let list: Vec<_> = providers
+                        .iter()
+                        .map(|(_, n, busy)| format!("{n} ({busy} busy)"))
+                        .collect();
+                    println!("* {model}: {}", list.join(", "));
+                }
+            }
+            Some("/ask") => {
+                let mut parts = line.splitn(3, ' ').skip(1);
+                let usage = "usage: /ask <model> <prompt>";
+                let model = parts.next().filter(|m| !m.is_empty()).context(usage)?;
+                self.ask(model.into(), parts.next().context(usage)?.into());
+            }
+            Some("/pin") => {
+                let who = words.next().context("usage: /pin <nick>")?;
+                let on = self.toggle(who, |st| &mut st.room.local.pinned)?;
+                println!("* {who} {}", if on { "pinned" } else { "unpinned" });
+            }
+            Some("/block") => {
+                let who = words.next().context("usage: /block <nick>")?;
+                let on = self.toggle(who, |st| &mut st.room.local.blocked)?;
+                println!("* {who} {}", if on { "blocked" } else { "unblocked" });
+            }
+            Some("/token") => {
+                let app = words.next().context("usage: /token <app>")?;
+                let token = infer::new_token()?;
+                let st = &mut *self.lock();
+                st.room.local.tokens.insert(app.into(), token.clone());
+                self.save(st);
+                println!("* token {app} {token}");
             }
             Some(w) if w.starts_with('/') => bail!("unknown command {w}"),
             Some(_) => {
@@ -404,7 +496,7 @@ impl Node {
                         nonce: nonce(),
                     },
                 )?;
-                self.chat(self.me, chat);
+                self.cast(self.me, chat);
             }
             None => {}
         }
@@ -420,6 +512,7 @@ pub async fn run(
     wire: Wire,
     online: HashSet<PeerId>,
     addrs: BTreeSet<Multiaddr>,
+    api: SocketAddr,
 ) -> Result<()> {
     let Wire {
         mut control,
@@ -428,6 +521,7 @@ pub async fn run(
     } = wire;
     let me = key.public().to_peer_id();
     let mut incoming = control.accept(PROTOCOL)?;
+    let mut asks = control.accept(infer::ASK)?;
     println!(
         "* in {} as {}",
         room.name(),
@@ -438,14 +532,22 @@ pub async fn run(
     let node = Arc::new(Node {
         key,
         me,
+        log_path: path
+            .parent()
+            .context("room file has no folder")?
+            .with_file_name("requests.log"),
         path,
         control,
         cmds,
+        http: reqwest::Client::new(),
         state: Mutex::new(State {
             room,
             online,
             addrs,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
+            beats: HashMap::new(),
+            inflight: HashMap::new(),
+            hits: HashMap::new(),
         }),
     });
     let targets = {
@@ -463,6 +565,14 @@ pub async fn run(
             tokio::spawn(n.clone().handle(peer, stream));
         }
     });
+    let n = node.clone();
+    tokio::spawn(async move {
+        while let Some((peer, stream)) = asks.next().await {
+            tokio::spawn(n.clone().provide(peer, stream));
+        }
+    });
+    tokio::spawn(infer::api(node.clone(), api));
+    let mut tick = tokio::time::interval(infer::BEAT_EVERY);
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
@@ -483,13 +593,31 @@ pub async fn run(
                     node.lock().addrs.insert(a);
                 }
             },
+            _ = tick.tick() => {
+                let sharing = {
+                    let st = &mut *node.lock();
+                    // ponytail: a member can replay a chat older than 10 min; reject old nonces if that matters.
+                    st.seen.retain(|_, at| at.elapsed() < Duration::from_secs(600));
+                    !st.room.local.shares.is_empty()
+                };
+                if sharing {
+                    node.beat();
+                }
+            }
             line = stdin.next_line() => match line? {
                 None => return Ok(()),
-                Some(line) => match node.command(line.trim()) {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => {}
-                    Err(e) => println!("* {e:#}"),
-                },
+                Some(line) => {
+                    let before = node.lock().room.local.shares.len();
+                    match node.command(line.trim()) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(e) => println!("* {e:#}"),
+                    }
+                    // Announce share changes now, not at the next tick.
+                    if node.lock().room.local.shares.len() != before {
+                        node.beat();
+                    }
+                }
             },
         }
     }
@@ -502,6 +630,7 @@ pub async fn join(
     ticket: Ticket,
     nick: String,
     swarm: Swarm<Behaviour>,
+    api: SocketAddr,
 ) -> Result<()> {
     let Event::Invite { room: room_id, .. } = ticket.invite.open()? else {
         bail!("ticket holds no invite")
@@ -563,5 +692,5 @@ pub async fn join(
     .await
     .context("no member reachable from the ticket")??;
     let path = rooms.join(format!("{}.json", room.id));
-    run(key, path, room, wire, online, addrs).await
+    run(key, path, room, wire, online, addrs, api).await
 }
