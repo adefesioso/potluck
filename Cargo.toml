@@ -5,10 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive"] }
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
-libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "ping", "ed25519", "macros"] }
+libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "ping", "ed25519", "macros", "serde"] }
 libp2p-stream = "0.5.0-alpha"
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 tokio = { version = "1.53.3", features = ["full"] }

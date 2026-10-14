@@ -2,19 +2,19 @@ use std::{
     fs,
     io::{ErrorKind, Write},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::Path,
     time::Duration,
 };
 
 use anyhow::Result;
 use libp2p::{
-    Swarm, dcutr, identify, identity::Keypair, noise, ping, relay, swarm::NetworkBehaviour, tcp,
-    yamux,
+    Multiaddr, Swarm, dcutr, identify, identity::Keypair, multiaddr::Protocol, noise, ping, relay,
+    swarm::NetworkBehaviour, tcp, yamux,
 };
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
-    // ponytail: every node is an open relay with libp2p's default rate limits; restrict to room members in phase 1.
+    // ponytail: every node is an open relay with libp2p's default rate limits; restrict to room members if relays get abused.
     relay: relay::Behaviour,
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
@@ -24,11 +24,8 @@ pub struct Behaviour {
 }
 
 /// Loads the identity key, creating it (mode 0600) on first run.
-pub fn load_key(path: Option<PathBuf>) -> Result<Keypair> {
-    let path = path.unwrap_or_else(|| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/potluck/key")
-    });
-    match fs::read(&path) {
+pub fn load_key(path: &Path) -> Result<Keypair> {
+    match fs::read(path) {
         Ok(bytes) => return Ok(Keypair::from_protobuf_encoding(&bytes)?),
         Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
         Err(_) => {}
@@ -41,7 +38,7 @@ pub fn load_key(path: Option<PathBuf>) -> Result<Keypair> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)?
+        .open(path)?
         .write_all(&key.to_protobuf_encoding()?)?;
     Ok(key)
 }
@@ -78,6 +75,17 @@ pub fn swarm(key: Keypair) -> Result<Swarm<Behaviour>> {
                 stream: libp2p_stream::Behaviour::new(),
             }
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|c| // Room members stay connected without traffic.
+            c.with_idle_connection_timeout(Duration::from_secs(3600)))
         .build())
+}
+
+/// Listens on all interfaces, plus a relay circuit for peers behind NAT.
+pub fn listen(swarm: &mut Swarm<Behaviour>, relay: Option<Multiaddr>) -> Result<()> {
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    if let Some(relay) = relay {
+        swarm.listen_on(relay.with(Protocol::P2pCircuit))?;
+    }
+    Ok(())
 }

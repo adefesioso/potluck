@@ -1,6 +1,12 @@
 mod net;
+mod node;
+mod room;
 
-use std::{io::Write as _, path::PathBuf};
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -14,9 +20,9 @@ const MAX_REQUEST: u64 = 1 << 20;
 #[derive(Parser)]
 #[command(about = "Share local models peer-to-peer")]
 struct Cli {
-    /// Identity key file [default: ~/.config/potluck/key]
+    /// State directory holding `key` and `rooms/` [default: ~/.config/potluck]
     #[arg(long, global = true)]
-    key: Option<PathBuf>,
+    dir: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -48,14 +54,72 @@ enum Cmd {
         model: String,
         prompt: String,
     },
+    /// Create a room you own
+    Create {
+        name: String,
+        #[arg(long, env = "USER", default_value = "anon")]
+        nick: String,
+    },
+    /// Chat in a room (by name or id prefix)
+    Chat {
+        room: String,
+        /// Relay to listen through when behind NAT
+        #[arg(long)]
+        relay: Option<Multiaddr>,
+    },
+    /// Join a room with a ticket from `/invite`, then chat
+    Join {
+        ticket: String,
+        #[arg(long, env = "USER", default_value = "anon")]
+        nick: String,
+        #[arg(long)]
+        relay: Option<Multiaddr>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut swarm = net::swarm(net::load_key(cli.key)?)?;
+    let dir = cli.dir.unwrap_or_else(|| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/potluck")
+    });
+    let rooms = dir.join("rooms");
+    fs::create_dir_all(&rooms)?;
+    let key = net::load_key(&dir.join("key"))?;
+    let mut swarm = net::swarm(key.clone())?;
     let me = *swarm.local_peer_id();
     match cli.cmd {
+        Cmd::Create { name, nick } => {
+            let room = room::Room::create(&key, &name, &nick)?;
+            fs::write(
+                rooms.join(format!("{}.json", room.id)),
+                serde_json::to_vec(&room)?,
+            )?;
+            println!("room {}", room.id);
+            Ok(())
+        }
+        Cmd::Chat { room, relay } => {
+            let (path, room) = find_room(&rooms, &room)?;
+            net::listen(&mut swarm, relay)?;
+            let wire = node::spawn_swarm(swarm);
+            node::run(
+                key,
+                path,
+                room,
+                wire,
+                Default::default(),
+                Default::default(),
+            )
+            .await
+        }
+        Cmd::Join {
+            ticket,
+            nick,
+            relay,
+        } => {
+            net::listen(&mut swarm, relay)?;
+            node::join(key, rooms, room::Ticket::decode(&ticket)?, nick, swarm).await
+        }
         Cmd::Relay { port } => {
             swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;
             swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
@@ -72,9 +136,7 @@ async fn main() -> Result<()> {
             backend,
             model,
         } => {
-            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-            swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-            swarm.listen_on(relay.with(Protocol::P2pCircuit))?;
+            net::listen(&mut swarm, Some(relay))?;
             let mut incoming = swarm.behaviour().stream.new_control().accept(PROTOCOL)?;
             let http = reqwest::Client::new();
             let url = format!("{}/v1/chat/completions", backend.trim_end_matches('/'));
@@ -127,6 +189,23 @@ async fn main() -> Result<()> {
             let body = json!({"model": model, "messages": [{"role": "user", "content": prompt}]});
             ask(control.open_stream(peer_id, PROTOCOL).await?, body).await
         }
+    }
+}
+
+/// Finds exactly one saved room whose name or id prefix matches.
+fn find_room(rooms: &Path, query: &str) -> Result<(PathBuf, room::Room)> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(rooms)? {
+        let path = entry?.path();
+        let room: room::Room = serde_json::from_slice(&fs::read(&path)?)?;
+        if room.name() == query || room.id.starts_with(query) {
+            found.push((path, room));
+        }
+    }
+    match found.len() {
+        1 => Ok(found.pop().unwrap()),
+        0 => bail!("no room matches {query}"),
+        _ => bail!("{query} matches several rooms; use an id prefix"),
     }
 }
 

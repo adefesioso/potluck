@@ -18,7 +18,7 @@ impl Drop for Kill {
 
 fn potluck(key: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_potluck"));
-    cmd.arg("--key").arg(key);
+    cmd.arg("--dir").arg(key);
     cmd
 }
 
