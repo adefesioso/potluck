@@ -21,8 +21,8 @@ IRC for AI: invite-only rooms where people chat and share their local models fre
 |---|---|
 | Identity | ed25519 keypair = libp2p peer ID. Nickname is display only; the key is identity. |
 | Room | invite-only group: ID = hash(genesis event). Has a member log, chat, and shared models. |
-| Member log | signed event DAG (genesis, invite, revoke, join, kick, role, mode, recover). Every member replays it to compute membership. An event is valid only if its issuer held the role at its causal parents; a kick or demote voids every event by that key outside its causal past. Concurrent conflicts: higher role > removal beats grant > lower hash. Timestamps are display-only. |
-| Roles | `owner` > `op` > `member` (IRC `~ @ +`). Ops invite and kick; modes set who can share or invoke. Issuers act only on lower roles (owners also on owners); only owners grant or remove op. Multiple owners allowed; if all owner keys are lost, a majority of ops files `recover`, effective after 7 days unless any owner signs an event. |
+| Member log | signed event DAG (genesis, invite, revoke, join, kick, role, mode, recover, rollback). Every member replays it to compute membership. An event is valid only if its issuer held the role at its causal parents; a kick or demote voids every event by that key outside its causal past. Concurrent conflicts: higher role > removal beats grant > lower hash. Timestamps are display-only. |
+| Roles | `owner` > `op` > `member` (IRC `~ @ +`). Ops invite and kick; modes set who can share or invoke. Issuers act only on lower roles (owners also on owners); only owners grant or remove op. After demoting or kicking an op, an owner may issue `rollback {op, since}`: every member that op kicked at or after `since` (default: the op grant) is restored at their prior role and re-added to MLS without an invite, unless a separate valid kick also removed them. Messages from the gap stay unreadable to them. Multiple owners allowed; if all owner keys are lost, a majority of ops files `recover`, effective after 7 days unless any owner signs an event. |
 | Invite | signed capability `{room_id, issuer, invitee_key?, uses, expiry, role, bootstrap_peers}`, shared as link or QR. `role` must be below the issuer's. Dies when a `revoke` names it or the issuer loses the role. |
 | Share | a member's signed record, latest by per-member sequence number (not clock): `{seq, model_id, ctx_len, max_concurrent, quota_per_member, visibility, bridgeable}` |
 | Model ID | sha256 of the weights file + quant. The display name (`llama3-70b`) is an alias that resolves to a hash. A provider's claim until its fingerprint checks out. |
@@ -88,7 +88,7 @@ The router is the part of each client that "takes care of the rest":
 | Kicked member keeps access | MLS epoch rotation on kick; new rendezvous keys |
 | Leaked invite | single-use or expiring invites; invitee-bound when the key is known; ops can revoke |
 | Member abuses a GPU | provider quotas, per-member rate limits, ops kick |
-| Rogue op | acts only on lower roles; only owners grant or remove op; demotion voids the op's concurrent events; `recover` has a 7-day owner veto |
+| Rogue op | acts only on lower roles; only owners grant or remove op; demotion voids the op's concurrent events; owner `rollback` restores the members they kicked; `recover` has a 7-day owner veto |
 | Backdated or replayed events | timestamps display-only; validity from DAG causality; revocation voids concurrent events |
 | Provider snoops prompts | disclosed; client shows who served; requester pins or blocks providers |
 | Provider fakes a model or quant | canary spot-checks against attested fingerprints; a provider that detects canaries and runs the real model only for them gets past this, so pin trusted members for sensitive work |
