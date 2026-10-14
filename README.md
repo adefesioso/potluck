@@ -35,6 +35,8 @@ potluck join <ticket> --nick bob             # joins, then chats
 
 `chat` and `join` open a full-screen TUI on a terminal (PageUp/PageDown scroll, Up/Down history, Ctrl-C quits) and plain stdin/stdout lines when piped. Both take `--relay <relay addr>` (for nodes behind NAT) and `--api <addr>` (endpoint, default `127.0.0.1:7777`).
 
+![alice's TUI: chat, /who, and an answer from bob's shared model](docs/tui.png)
+
 | Command | Effect |
 |---|---|
 | `/invite [uses] [hours] [peer-id]`, `/revoke <id>`, `/remove <nick>` | owner only: manage members |
@@ -42,10 +44,8 @@ potluck join <ticket> --nick bob             # joins, then chats
 | `/share <model> <backend-url> [max_concurrent] [per_min] [max_tokens]`, `/unshare <model>` | serve a local model to the room (defaults 1, 30, none) |
 | `/models`, `/ask <model> <prompt>` | list online models; ask one |
 | `/pin <nick>`, `/block <nick>` | toggle: prefer a provider; refuse to use or serve a member |
-| `/token <app>` | bearer token for the endpoint |
+| `/token <app>` | bearer token for the endpoint `http://127.0.0.1:7777/r/<room>/v1`; point any OpenAI-compatible client there |
 | other lines | chat messages |
-
-Endpoint: `http://127.0.0.1:7777/r/<room>/v1` with `Authorization: Bearer <token>`. Point any OpenAI-compatible client there.
 
 State lives in `~/.config/potluck/` (override with `--dir`): `key`, `rooms/<id>.json` (events, peers, shares, tokens), `requests.log`, `invite.txt` (last ticket).
 
