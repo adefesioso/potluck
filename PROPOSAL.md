@@ -25,7 +25,8 @@ IRC for AI: invite-only rooms where people chat and share their local models fre
 | Roles | `owner` > `op` > `member` (IRC `~ @ +`). Ops invite and kick; modes set who can share or invoke. Issuers act only on lower roles (owners also on owners); only owners grant or remove op. Multiple owners allowed; if all owner keys are lost, a majority of ops files `recover`, effective after 7 days unless any owner signs an event. |
 | Invite | signed capability `{room_id, issuer, invitee_key?, uses, expiry, role, bootstrap_peers}`, shared as link or QR. `role` must be below the issuer's. Dies when a `revoke` names it or the issuer loses the role. |
 | Share | a member's signed record, latest by per-member sequence number (not clock): `{seq, model_id, ctx_len, max_concurrent, quota_per_member, visibility, bridgeable}` |
-| Model ID | sha256 of the weights file + quant. The display name (`llama3-70b`) is an alias that resolves to a hash. A provider's claim, not proof. |
+| Model ID | sha256 of the weights file + quant. The display name (`llama3-70b`) is an alias that resolves to a hash. A provider's claim until its fingerprint checks out. |
+| Fingerprint | top-5 logprobs of the first 8 greedy tokens for 16 canary prompts. Any member holding the weights runs `/attest <model>` and publishes a signed `{model_id, fingerprint}`. Disagreeing attestations mark the model ID `disputed`. |
 | Anchor | optional always-on member (like an IRC bouncer) that keeps history and relays. Holds no extra rights. |
 | Fork | explicit split (`/fork`): new genesis references the parent room; members opt in. Never implicit. |
 | Bridge | member of two rooms that re-shares `bridgeable` shares into the other room under its own identity and quota; sees forwarded plaintext. |
@@ -61,6 +62,7 @@ The router is the part of each client that "takes care of the rest":
 | Gossip | gossipsub topic per room for chat; shares sync by set reconciliation, gossip carries deltas only |
 | Model resolution | alias → model IDs → members currently sharing them |
 | Selection | probe 2–3 candidates for load (never gossiped); pick by load, RTT, and remaining quota, preferring pinned members; fail over mid-queue if a provider drops |
+| Verification | router always asks for logprobs (stripped before the app sees them), so canary spot-checks (~1% of requests) look like ordinary traffic. Match = same top-1 tokens and logprob distance within a tolerance set per backend. A mismatch marks the share `mismatch` locally and drops it from auto-selection; `/models -v` shows `verified`, `unverified`, `mismatch`, or `disputed`. |
 | Fairness | each provider runs a fair queue per member plus its own quotas; may locally weight toward members who served *it*, using only its own receipts. No currency. |
 | History | members keep encrypted history and new joiners backfill from peers. Only events after joining are readable. |
 
@@ -73,7 +75,7 @@ The router is the part of each client that "takes care of the rest":
 
 ## Interfaces
 
-- **TUI chat client:** IRC-style commands `/join /invite /kick /op /fork /share /unshare /models /ask /who`. `/models` aggregates per alias (`-v` lists providers); sub-channels `#room/<name>` split chat in large rooms.
+- **TUI chat client:** IRC-style commands `/join /invite /kick /op /fork /share /unshare /models /ask /attest /who`. `/models` aggregates per alias (`-v` lists providers); sub-channels `#room/<name>` split chat in large rooms.
 - **Reciprocity mode `+r`:** off by default; `/who` shows rough served/used buckets from published receipts over a rolling 30 days. Social signal only; never affects routing.
 - **Local OpenAI-compatible endpoint:** `http://127.0.0.1:7777/r/<room>/v1`, so existing apps and IDEs use room models transparently. Requires a per-app bearer token (`/token`); rejects browser `Origin` and non-local `Host` headers.
 - **Bots:** a share can be addressed in chat (`@llama3-70b ...`) and answers appear as messages from the serving member. Bot output never triggers other bots.
@@ -88,7 +90,9 @@ The router is the part of each client that "takes care of the rest":
 | Member abuses a GPU | provider quotas, per-member rate limits, ops kick |
 | Rogue op | acts only on lower roles; only owners grant or remove op; demotion voids the op's concurrent events; `recover` has a 7-day owner veto |
 | Backdated or replayed events | timestamps display-only; validity from DAG causality; revocation voids concurrent events |
-| Provider snoops prompts or fakes a model | disclosed; Model ID is a claim; client shows who served; requester pins or blocks providers |
+| Provider snoops prompts | disclosed; client shows who served; requester pins or blocks providers |
+| Provider fakes a model or quant | canary spot-checks against attested fingerprints; a provider that detects canaries and runs the real model only for them gets past this, so pin trusted members for sensitive work |
+| False attestation to smear honest providers | attestations are signed; `disputed` shows every attester; a mismatch only affects the local router and is never broadcast |
 | Requester hits backend admin APIs | provider forwards only chat/completion calls for the shared model |
 | Local process or website uses the endpoint | 127.0.0.1 bind, per-app token, `Origin`/`Host` checks (blocks CSRF, DNS rebinding) |
 | Free-riding or faked reciprocity | checkpointed receipts; providers weight only by their own receipts |
@@ -110,6 +114,6 @@ The router is the part of each client that "takes care of the rest":
 | 0 | Two peers across NAT; `/ask` routed to the other's llama.cpp over Noise | streamed completion via relay |
 | 1 | Rooms: member log DAG + merge, invites, roles, gossip chat (no MLS yet) | 5 people chat and share in one room |
 | 2 | MLS group encryption, kick rotation, rendezvous discovery | kicked member is locked out |
-| 3 | Router selection, fair queues, quotas, OpenAI endpoint | IDE uses a room model transparently |
+| 3 | Router selection, fair queues, quotas, OpenAI endpoint, fingerprint verification | IDE uses a room model transparently |
 | 4 | Anchors, history backfill, TUI polish, multi-room, bridges, receipts | public alpha |
 | 5 | Cross-room grants: a share's owner, with room A owner approval, lets room B members use it via B-op tokens bound to a member key, 24h expiry, one shared quota | B member uses A's share without joining A |
