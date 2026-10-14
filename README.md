@@ -1,6 +1,8 @@
 # Potluck
 
-Invite-only rooms where people chat and share their local models. Peer-to-peer, NAT-traversing, end-to-end encrypted. Design and roadmap: [PROPOSAL.md](PROPOSAL.md).
+Your GPU idles most of the day. So do your friends'. Potluck pools them: invite-only rooms where you chat and share local models peer-to-peer, through any NAT, encrypted end to end. No server, no API keys handed around, no one else holding your prompts. Every app in the room gets one OpenAI-compatible endpoint backed by everyone's hardware.
+
+**Bring a model, pull up a chair:** build it, `potluck create`, send an invite. Design and roadmap: [PROPOSAL.md](PROPOSAL.md).
 
 ## Problem
 
