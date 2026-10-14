@@ -1,80 +1,75 @@
+<p align="center"><img src="docs/logo.svg" width="120" alt="Potluck logo: a pot whose steam links three peers"></p>
+
 # Potluck
 
 Your GPU idles most of the day. So do your friends'. Potluck pools them: invite-only rooms where you chat and share local models peer-to-peer, through any NAT, encrypted end to end. No server, no API keys handed around, no one else holding your prompts. Every app in the room gets one OpenAI-compatible endpoint backed by everyone's hardware.
 
-**Bring a model, pull up a chair:** build it, `potluck create`, send an invite. Design and roadmap: [PROPOSAL.md](PROPOSAL.md).
-
 ## Problem
 
-Friends and teams run local models (llama.cpp, vLLM, Ollama) but can't easily use each other's: sharing needs network setup, per-person credentials, and a way to find whose GPU is free.
+- Friends and teams run local models (llama.cpp, vLLM, Ollama) but can't easily use each other's.
+- Sharing one needs network setup, per-person credentials, and a way to see whose GPU is free.
+- Hosted services hold every prompt and decide who gets access.
+
+## Quick start
+
+```sh
+cargo build --release
+potluck relay --port 4001                    # on a reachable host; prints: listening <addr>
+potluck create friends --nick alice          # prints: room <id>
+```
+
+1. **Invite.** alice runs `potluck chat friends --relay <addr>`, types `/invite`, and sends bob the ticket saved in `invite.txt`.
+   ![alice types /invite; the TUI prints the ticket and saves it to invite.txt](docs/invite.png)
+2. **Join and share.** bob runs `potluck join <ticket> --nick bob --relay <addr>`, then `/share qwen3-8b http://127.0.0.1:11434` to serve the model from Ollama.
+   ![bob's TUI after joining: chat, /share qwen3-8b, and the sidebar lists it](docs/share.png)
+3. **Ask.** alice runs `/models` to see who serves what, then `/ask qwen3-8b <prompt>`; bob's GPU answers.
+   ![alice's TUI: chat, /who, and an answer from bob's shared model](docs/tui.png)
+4. **Use it from apps.** alice runs `/token <app>` and points any OpenAI client at the [local endpoint](#local-endpoint).
+
+`chat` and `join` open a full-screen TUI (PageUp/PageDown scroll, Up/Down history, Ctrl-C quits); piped, they read and write plain lines. Flags: `--relay <addr>` (needed behind NAT), `--api <addr>` (endpoint, default `127.0.0.1:7777`), `--dir <path>` (state, default `~/.config/potluck/`).
+
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/invite [uses] [hours] [peer-id]` | owner: write a ticket to `invite.txt` (limited-use, expiring, optionally bound to one key) |
+| `/revoke <id>`, `/remove <nick>` | owner: cancel an invite; lock a member out |
+| `/who` | members and who's online |
+| `/share <model> <backend-url> [max_concurrent] [per_min] [max_tokens]` | serve a local OpenAI-compatible backend's model to the room (defaults 1, 30, none) |
+| `/unshare <model>` | stop now; in-flight streams end with an error |
+| `/models`, `/ask <model> <prompt>` | list online models and providers; ask one |
+| `/pin <nick>`, `/block <nick>` | toggle: prefer a provider; refuse to use or serve a member |
+| `/token <app>` | bearer token for the local endpoint |
+| `/quit`, other lines | leave; chat message |
+
+## Local endpoint
+
+Point any OpenAI-compatible client at `http://127.0.0.1:7777/r/<room>/v1` with a `/token` bearer token.
+
+- Serves `GET models` and `POST chat/completions` (streaming or not).
+- Names the serving member in the `x-potluck-provider` header; returns 503 when no member serves the model.
+- Accepts only local callers: loopback bind, per-app token, no browser `Origin`, loopback `Host`.
+
+![curl lists the room's models, then gets a completion served by bob](docs/endpoint.png)
 
 ## How it works
 
 | Piece | Role |
 |---|---|
 | Node | one `potluck` binary per person; ed25519 key = libp2p peer ID = identity |
-| Room | owner-created, invite-only; membership = signed events every member merges ([concepts](PROPOSAL.md#concepts)) |
-| Relay | any reachable node; forwards encrypted circuits for peers behind NAT, then DCUtR tries a direct hole-punched path |
-| Provider | member that `/share`s a model; forwards room requests to its localhost OpenAI-compatible backend within its limits |
-| Router | picks a provider from heartbeats, opens a Noise-encrypted stream, streams the answer back |
-| Endpoint | local OpenAI-compatible API, so apps and IDEs use room models |
+| Room | owner-created, invite-only, 2-30 people; membership = signed events every member merges |
+| Relay | any reachable node; forwards encrypted circuits for peers behind NAT, then DCUtR tries a direct path |
+| Provider | member that `/share`s a model; forwards requests to its localhost backend within its limits |
+| Router | picks a provider from heartbeats (pinned first, then least busy), streams the answer back over Noise |
 
-## Status
+Trust ends at the room: members see each other's chat and models; providers see the prompts they serve. Nothing about a room is published. Chat has no history: members see messages while online.
 
-Phase 2 of the [roadmap](PROPOSAL.md#roadmap): rooms with invites, removal, chat, model sharing, and the local endpoint. Public alpha.
+## Docs
 
-## Usage
-
-```sh
-cargo build --release
-potluck relay --port 4001                    # on a reachable host; prints: listening <addr>
-potluck create friends --nick alice          # prints: room <id>
-potluck chat friends                         # chat; /invite saves a ticket to invite.txt
-potluck join <ticket> --nick bob             # joins, then chats
-```
-
-`chat` and `join` open a full-screen TUI on a terminal (PageUp/PageDown scroll, Up/Down history, Ctrl-C quits) and plain stdin/stdout lines when piped. Both take `--relay <relay addr>` (for nodes behind NAT) and `--api <addr>` (endpoint, default `127.0.0.1:7777`).
-
-![alice's TUI: chat, /who, and an answer from bob's shared model](docs/tui.png)
-
-| Command | Effect |
+| Doc | Covers |
 |---|---|
-| `/invite [uses] [hours] [peer-id]`, `/revoke <id>`, `/remove <nick>` | owner only: manage members |
-| `/who` | members and who's online |
-| `/share <model> <backend-url> [max_concurrent] [per_min] [max_tokens]`, `/unshare <model>` | serve a local model to the room (defaults 1, 30, none) |
-| `/models`, `/ask <model> <prompt>` | list online models; ask one |
-| `/pin <nick>`, `/block <nick>` | toggle: prefer a provider; refuse to use or serve a member |
-| `/token <app>` | bearer token for the endpoint `http://127.0.0.1:7777/r/<room>/v1`; point any OpenAI-compatible client there |
-| other lines | chat messages |
-
-State lives in `~/.config/potluck/` (override with `--dir`): `key`, `rooms/<id>.json` (events, peers, shares, tokens), `requests.log`, `invite.txt` (last ticket).
-
-## Wire protocol `/potluck/ask/1`
-
-- Requester sends one OpenAI chat-completions JSON body, then half-closes.
-- Provider replies with a line `{"status":<http status>,"error"?:<msg>}`, then the backend's body verbatim.
-- Provider refuses non-members, blocked members, unshared models (404), and requests over its limits (429, so the router tries the next provider); it forwards only to `<backend>/v1/chat/completions`, with `max_tokens` clamped.
-- After `/unshare`, an in-flight stream ends with `data: {"error":...}`.
-
-## Wire protocol `/potluck/room/1`
-
-One JSON message per stream, sender half-closes, optional JSON reply:
-
-| Message | Reply |
-|---|---|
-| `join` (signed join event) | `sync` with the room's events, or `denied` |
-| `sync {events, peers}` from a member | `sync` with the receiver's events and peers, or `denied` |
-| `cast` (signed chat or heartbeat, from a member) | none; receiver forwards new ones to its other members |
-
-## Layout
-
-| File | Contents |
-|---|---|
-| `src/main.rs` | CLI: `relay`, `create`, `chat`, `join` |
-| `src/net.rs` | key loading and swarm setup (TCP/QUIC, Noise, Yamux, relay, DCUtR) |
-| `src/room.rs` | signed events, membership, admission checks, tickets |
-| `src/node.rs` | room node: swarm loop, `/potluck/room/1` handlers, chat REPL |
-| `src/node/infer.rs` | provider, router, heartbeats, endpoint |
-| `src/ui.rs` | output sink; line frontend and ratatui TUI |
-| `tests/phase1.rs`, `tests/phase2.rs` | five members chat, a removed member is locked out; an OpenAI client uses a member's model |
-| `tests/lab.sh` | on a pvelab Proxmox node: two members behind separate NATs join, chat, and share via relay |
+| [docs/design.md](docs/design.md) | principles, concepts, membership rules, routing, owner controls |
+| [docs/security.md](docs/security.md) | security properties and threat model |
+| [docs/protocol.md](docs/protocol.md) | wire protocols and on-disk state |
+| [docs/development.md](docs/development.md) | stack, source layout, tests |
+| [docs/roadmap.md](docs/roadmap.md) | status, phases, deferred features and their triggers |
