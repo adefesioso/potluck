@@ -461,7 +461,7 @@ impl Node {
                 say!("* unshared {model}");
             }
             Some("/models") => {
-                let models = self.online_models();
+                let models = self.listed_models();
                 if models.is_empty() {
                     say!("* no models online");
                 }
@@ -587,7 +587,7 @@ pub async fn run(
     let mut tick = tokio::time::interval(infer::BEAT_EVERY);
     let n = node.clone();
     let mut input = ui::input(mode, move || {
-        let models = n.online_models().into_iter().map(|(model, providers)| {
+        let models = n.listed_models().into_iter().map(|(model, providers)| {
             let nicks: Vec<_> = providers.into_iter().map(|(_, nick, _)| nick).collect();
             format!("{model}: {}", nicks.join(", "))
         });

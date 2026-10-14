@@ -129,6 +129,21 @@ impl Node {
         models
     }
 
+    /// `online_models` plus our own shares, for display; routing never picks us.
+    pub(super) fn listed_models(&self) -> BTreeMap<String, Vec<(PeerId, String, u32)>> {
+        let mut models = self.online_models();
+        let st = self.lock();
+        let nick = st.room.members().get(&self.me).cloned().unwrap_or_default();
+        let busy = st.inflight.values().sum();
+        for m in st.room.local.shares.keys() {
+            models
+                .entry(m.clone())
+                .or_default()
+                .push((self.me, nick.clone(), busy));
+        }
+        models
+    }
+
     /// Candidates for `model`: pinned first, then least busy; blocked members never.
     fn providers(&self, model: &str) -> Vec<(PeerId, String)> {
         let mut found = self.online_models().remove(model).unwrap_or_default();
