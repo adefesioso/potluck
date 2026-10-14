@@ -87,14 +87,14 @@ async fn main() -> Result<()> {
         }
         Cmd::Chat { room, opts } => {
             let (path, room) = find_room(&rooms, &room)?;
-            net::listen(&mut swarm, opts.relay)?;
+            net::listen(&mut swarm, opts.relay).await?;
             let wire = node::spawn_swarm(swarm);
             let done = node::run(key, path, room, wire, opts.api, ui::mode()).await;
             ui::restore();
             done
         }
         Cmd::Join { ticket, nick, opts } => {
-            net::listen(&mut swarm, opts.relay)?;
+            net::listen(&mut swarm, opts.relay).await?;
             let ticket = room::Ticket::decode(&ticket)?;
             let done = node::join(key, rooms, ticket, nick, swarm, opts.api, ui::mode()).await;
             ui::restore();
@@ -105,8 +105,13 @@ async fn main() -> Result<()> {
             swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
             loop {
                 if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
-                    // ponytail: trusts every listen address as reachable; add --external when behind NAT/cloud LB.
-                    swarm.add_external_address(address.clone());
+                    // ponytail: trusts every non-loopback listen address as reachable; add --external when behind NAT/cloud LB.
+                    if !address
+                        .iter()
+                        .any(|p| matches!(p, Protocol::Ip4(ip) if ip.is_loopback()))
+                    {
+                        swarm.add_external_address(address.clone());
+                    }
                     println!("listening {}", address.with(Protocol::P2p(me)));
                 }
             }

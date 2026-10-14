@@ -6,10 +6,15 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, dcutr, identify, identity::Keypair, multiaddr::Protocol, noise, ping, relay,
-    swarm::NetworkBehaviour, tcp, yamux,
+    Multiaddr, Swarm, dcutr, identify,
+    identity::Keypair,
+    multiaddr::Protocol,
+    noise, ping, relay,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
 };
 
 #[derive(NetworkBehaviour)]
@@ -81,11 +86,35 @@ pub fn swarm(key: Keypair) -> Result<Swarm<Behaviour>> {
 }
 
 /// Listens on all interfaces, plus a relay circuit for peers behind NAT.
-pub fn listen(swarm: &mut Swarm<Behaviour>, relay: Option<Multiaddr>) -> Result<()> {
+pub async fn listen(swarm: &mut Swarm<Behaviour>, relay: Option<Multiaddr>) -> Result<()> {
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    if let Some(relay) = relay {
-        swarm.listen_on(relay.with(Protocol::P2pCircuit))?;
-    }
+    let Some(relay) = relay else { return Ok(()) };
+    // Connect before reserving: the relay client aborts a circuit dial that races its own relay dial.
+    // ponytail: no re-reservation if the relay connection later drops; restart the node.
+    let Some(Protocol::P2p(relay_id)) = relay.iter().last() else {
+        bail!("--relay needs a /p2p/<id> suffix")
+    };
+    swarm.dial(relay.clone())?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == relay_id => {
+                    return Ok(());
+                }
+                SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(p),
+                    error,
+                    ..
+                } if p == relay_id => {
+                    bail!("relay unreachable: {error}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("relay unreachable: timed out")??;
+    swarm.listen_on(relay.with(Protocol::P2pCircuit))?;
     Ok(())
 }

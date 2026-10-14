@@ -76,5 +76,5 @@ One JSON message per stream, sender half-closes, optional JSON reply:
 | `src/node.rs` | room node: swarm loop, `/potluck/room/1` handlers, chat REPL |
 | `src/node/infer.rs` | provider, router, heartbeats, endpoint |
 | `src/ui.rs` | output sink; line frontend and ratatui TUI |
-| `tests/phase1.rs` | five members chat; a removed member is locked out |
-| `tests/phase2.rs` | an OpenAI client uses a model shared by another member |
+| `tests/phase1.rs`, `tests/phase2.rs` | five members chat, a removed member is locked out; an OpenAI client uses a member's model |
+| `tests/lab.sh` | on a pvelab Proxmox node: two members behind separate NATs join, chat, and share via relay |

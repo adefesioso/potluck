@@ -79,6 +79,10 @@ pub fn spawn_swarm(mut swarm: Swarm<Behaviour>) -> Wire {
     let me = *swarm.local_peer_id();
     let (cmds, mut cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, events) = mpsc::unbounded_channel();
+    // Addresses reported before this loop (e.g. while `listen` waited for the relay).
+    for a in swarm.listeners() {
+        let _ = ev_tx.send(Net::Addr(a.clone().with_p2p(me).unwrap_or_else(|a| a)));
+    }
     tokio::spawn(async move {
         loop {
             tokio::select! {
