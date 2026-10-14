@@ -306,13 +306,13 @@ impl Node {
             let body = json!({"model": model, "stream": true, "messages": [{"role": "user", "content": prompt}]});
             match node.route(&body).await {
                 Ok((nick, Head { status: 200, .. }, body)) => match read_sse(body).await {
-                    Ok(text) => println!("<{model}@{nick}> {text}"),
-                    Err(e) => println!("* {nick}: {e:#}"),
+                    Ok(text) => say!("<{model}@{nick}> {text}"),
+                    Err(e) => say!("* {nick}: {e:#}"),
                 },
                 Ok((nick, Head { status, error }, _)) => {
-                    println!("* {nick}: {status} {}", error.unwrap_or_default())
+                    say!("* {nick}: {status} {}", error.unwrap_or_default())
                 }
-                Err(e) => println!("* {e:#}"),
+                Err(e) => say!("* {e:#}"),
             }
         });
     }
@@ -366,10 +366,10 @@ fn oai_error(status: StatusCode, msg: impl Display) -> Response {
 pub async fn api(node: Arc<Node>, addr: SocketAddr) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
-        Err(e) => return println!("* api unavailable on {addr}: {e}"),
+        Err(e) => return say!("* api unavailable on {addr}: {e}"),
     };
     let name = node.lock().room.name();
-    println!(
+    say!(
         "* api http://{}/r/{name}/v1",
         listener.local_addr().unwrap()
     );
@@ -379,7 +379,7 @@ pub async fn api(node: Arc<Node>, addr: SocketAddr) {
         .route_layer(middleware::from_fn_with_state(node.clone(), guard))
         .with_state(node);
     if let Err(e) = axum::serve(listener, app).await {
-        println!("* api stopped: {e}");
+        say!("* api stopped: {e}");
     }
 }
 

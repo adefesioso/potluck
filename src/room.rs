@@ -321,9 +321,11 @@ impl Ticket {
         B64.encode(serde_json::to_vec(self).unwrap())
     }
 
+    /// Tolerates whitespace and line breaks from copying a wrapped ticket.
     pub fn decode(s: &str) -> Result<Self> {
         Ok(serde_json::from_slice(
-            &B64.decode(s.trim()).context("bad ticket")?,
+            &B64.decode(s.split_whitespace().collect::<String>())
+                .context("bad ticket")?,
         )?)
     }
 }

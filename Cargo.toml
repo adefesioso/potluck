@@ -8,9 +8,11 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3.34"
 libp2p = { version = "0.57.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "relay", "dcutr", "identify", "ping", "ed25519", "macros", "serde"] }
 libp2p-stream = "0.5.0-alpha"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

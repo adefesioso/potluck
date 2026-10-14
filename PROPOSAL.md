@@ -67,7 +67,7 @@ bob: /ask llama3.1:70b "explain this diff"
 
 ## Interfaces
 
-- **Chat REPL:** line-based, IRC-style: `/invite /revoke /remove /who /share /unshare /models /ask /pin /block /token /quit`. `/models` lists each model with online providers.
+- **TUI chat client** (plain lines when piped), IRC-style: `/invite /revoke /remove /who /share /unshare /models /ask /pin /block /token /quit`. `/models` lists each model with online providers.
 - **Local OpenAI-compatible endpoint:** `http://127.0.0.1:7777/r/<room>/v1`, so apps and IDEs use room models directly. Requires a per-app bearer token (`/token`); rejects browser `Origin` and non-local `Host` headers. Serves `GET models` and `POST chat/completions` (streaming or not); names the serving member in `x-potluck-provider`; returns 503 when no member serves the model.
 
 ## Threat Model
@@ -86,7 +86,7 @@ bob: /ask llama3.1:70b "explain this diff"
 
 ## Stack
 
-- Rust: rust-libp2p (transport, NAT, relay, DHT), tokio, axum (endpoint).
+- Rust: rust-libp2p (transport, NAT, relay, DHT), tokio, axum (endpoint), ratatui (TUI).
 - JSON wire messages and per-room JSON files for the member set and known addresses.
 - Inference adapters: any OpenAI-compatible HTTP backend (llama.cpp server, vLLM, Ollama, LM Studio).
 
@@ -96,7 +96,7 @@ bob: /ask llama3.1:70b "explain this diff"
 |---|---|---|
 | 0 | Two peers across NAT; `/ask` routed to the other's llama.cpp over Noise | streamed completion via relay |
 | 1 | Rooms: invites, joins, remove, signed chat, address exchange | 5 people chat; removed member is locked out |
-| 2 | Shares, heartbeats, selection, limits, OpenAI endpoint | IDE uses a room model; public alpha |
+| 2 | Shares, heartbeats, selection, limits, OpenAI endpoint, TUI | IDE uses a room model; public alpha |
 
 ## Later
 
@@ -111,7 +111,7 @@ Each item ships when its trigger shows up in real use.
 | DHT rendezvous | members' addresses change faster than they sync |
 | Cross-room sharing | providers ask to serve more than one room's members from a single share |
 | Usage reciprocity | providers report free-riding |
-| Bots, sub-channels, full-screen TUI | rooms get busy enough that a line REPL can't keep up |
+| Bots, sub-channels | rooms get busy enough to need them |
 | Share visibility for chosen members | owners want to share with part of a room |
 | Local-first preemption, active hours | owners share GPUs they also use daily |
 | `/ask -r`: post question and answer to the room | members want to discuss answers together |

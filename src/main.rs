@@ -1,3 +1,5 @@
+#[macro_use]
+mod ui;
 mod net;
 mod node;
 mod room;
@@ -87,28 +89,16 @@ async fn main() -> Result<()> {
             let (path, room) = find_room(&rooms, &room)?;
             net::listen(&mut swarm, opts.relay)?;
             let wire = node::spawn_swarm(swarm);
-            node::run(
-                key,
-                path,
-                room,
-                wire,
-                Default::default(),
-                Default::default(),
-                opts.api,
-            )
-            .await
+            let done = node::run(key, path, room, wire, opts.api, ui::mode()).await;
+            ui::restore();
+            done
         }
         Cmd::Join { ticket, nick, opts } => {
             net::listen(&mut swarm, opts.relay)?;
-            node::join(
-                key,
-                rooms,
-                room::Ticket::decode(&ticket)?,
-                nick,
-                swarm,
-                opts.api,
-            )
-            .await
+            let ticket = room::Ticket::decode(&ticket)?;
+            let done = node::join(key, rooms, ticket, nick, swarm, opts.api, ui::mode()).await;
+            ui::restore();
+            done
         }
         Cmd::Relay { port } => {
             swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;

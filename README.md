@@ -29,11 +29,11 @@ Phase 2 of the [roadmap](PROPOSAL.md#roadmap): rooms with invites, removal, chat
 cargo build --release
 potluck relay --port 4001                    # on a reachable host; prints: listening <addr>
 potluck create friends --nick alice          # prints: room <id>
-potluck chat friends                         # chat; /invite prints a ticket
+potluck chat friends                         # chat; /invite saves a ticket to invite.txt
 potluck join <ticket> --nick bob             # joins, then chats
 ```
 
-`chat` and `join` take `--relay <relay addr>` (for nodes behind NAT) and `--api <addr>` (endpoint, default `127.0.0.1:7777`).
+`chat` and `join` open a full-screen TUI on a terminal (PageUp/PageDown scroll, Up/Down history, Ctrl-C quits) and plain stdin/stdout lines when piped. Both take `--relay <relay addr>` (for nodes behind NAT) and `--api <addr>` (endpoint, default `127.0.0.1:7777`).
 
 | Command | Effect |
 |---|---|
@@ -47,7 +47,7 @@ potluck join <ticket> --nick bob             # joins, then chats
 
 Endpoint: `http://127.0.0.1:7777/r/<room>/v1` with `Authorization: Bearer <token>`. Point any OpenAI-compatible client there.
 
-State lives in `~/.config/potluck/` (override with `--dir`): `key`, `rooms/<id>.json` (events, peers, shares, tokens), `requests.log`.
+State lives in `~/.config/potluck/` (override with `--dir`): `key`, `rooms/<id>.json` (events, peers, shares, tokens), `requests.log`, `invite.txt` (last ticket).
 
 ## Wire protocol `/potluck/ask/1`
 
@@ -75,5 +75,6 @@ One JSON message per stream, sender half-closes, optional JSON reply:
 | `src/room.rs` | signed events, membership, admission checks, tickets |
 | `src/node.rs` | room node: swarm loop, `/potluck/room/1` handlers, chat REPL |
 | `src/node/infer.rs` | provider, router, heartbeats, endpoint |
+| `src/ui.rs` | output sink; line frontend and ratatui TUI |
 | `tests/phase1.rs` | five members chat; a removed member is locked out |
 | `tests/phase2.rs` | an OpenAI client uses a model shared by another member |

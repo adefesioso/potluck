@@ -24,11 +24,12 @@ use libp2p::{
 };
 use libp2p_stream::Control;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncBufReadExt, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     net::Behaviour,
     room::{Event, Room, Share, Signed, Ticket, nonce, now},
+    ui,
 };
 
 const PROTOCOL: StreamProtocol = StreamProtocol::new("/potluck/room/1");
@@ -68,6 +69,9 @@ pub struct Wire {
     control: Control,
     cmds: mpsc::UnboundedSender<Cmd>,
     events: mpsc::UnboundedReceiver<Net>,
+    /// Peers connected and our addresses seen so far, before the node takes over.
+    online: HashSet<PeerId>,
+    addrs: BTreeSet<Multiaddr>,
 }
 
 pub fn spawn_swarm(mut swarm: Swarm<Behaviour>) -> Wire {
@@ -111,6 +115,8 @@ pub fn spawn_swarm(mut swarm: Swarm<Behaviour>) -> Wire {
         control,
         cmds,
         events,
+        online: HashSet::new(),
+        addrs: BTreeSet::new(),
     }
 }
 
@@ -225,12 +231,12 @@ impl Node {
         let after = st.room.members();
         for (p, nick) in &after {
             if !before.contains_key(p) {
-                println!("* {nick} joined");
+                say!("* {nick} joined");
             }
         }
         for (p, nick) in &before {
             if !after.contains_key(p) {
-                println!("* {nick} removed");
+                say!("* {nick} removed");
                 let _ = self.cmds.send(Cmd::Drop(*p));
             }
         }
@@ -255,7 +261,7 @@ impl Node {
         tokio::spawn(async move {
             match send(node.control.clone(), peer, &msg).await {
                 Ok(Some(Msg::Sync { events, peers })) => node.merge(Some(peer), events, peers),
-                Ok(Some(Msg::Denied { reason })) => println!("* {peer} refused sync: {reason}"),
+                Ok(Some(Msg::Denied { reason })) => say!("* {peer} refused sync: {reason}"),
                 _ => {}
             }
         });
@@ -275,7 +281,7 @@ impl Node {
             return;
         }
         match event {
-            Event::Chat { text, .. } if signed.by != self.me => println!("<{nick}> {text}"),
+            Event::Chat { text, .. } if signed.by != self.me => say!("<{nick}> {text}"),
             Event::Heartbeat {
                 ts, models, busy, ..
             } if signed.by != self.me => Self::on_beat(st, signed.by, ts, models, busy),
@@ -377,7 +383,7 @@ impl Node {
                     } else {
                         "offline"
                     };
-                    println!("* {nick} {p} {role} {here}");
+                    say!("* {nick} {p} {role} {here}");
                 }
             }
             Some("/invite") => {
@@ -397,11 +403,12 @@ impl Node {
                     unreachable!()
                 };
                 peers.sort_by_key(|a| a.iter().last() != Some(Protocol::P2p(self.me))); // ours first
-                println!(
-                    "* invite {} {}",
-                    invite.id(),
-                    Ticket { invite, peers }.encode()
-                );
+                let (id, ticket) = (invite.id(), Ticket { invite, peers }.encode());
+                // Long tickets are hard to copy out of the TUI; the file is easy to send.
+                let file = self.log_path.with_file_name("invite.txt");
+                fs::write(&file, &ticket)?;
+                say!("* invite {id} {ticket}");
+                say!("* ticket saved to {}", file.display());
             }
             Some("/revoke") => {
                 owner_only()?;
@@ -440,26 +447,26 @@ impl Node {
                 let st = &mut *self.lock();
                 st.room.local.shares.insert(model.clone(), share);
                 self.save(st);
-                println!("* sharing {model}");
+                say!("* sharing {model}");
             }
             Some("/unshare") => {
                 let model = words.next().context("usage: /unshare <model>")?;
                 let st = &mut *self.lock();
                 st.room.local.shares.remove(model).context("not shared")?;
                 self.save(st);
-                println!("* unshared {model}");
+                say!("* unshared {model}");
             }
             Some("/models") => {
                 let models = self.online_models();
                 if models.is_empty() {
-                    println!("* no models online");
+                    say!("* no models online");
                 }
                 for (model, providers) in models {
                     let list: Vec<_> = providers
                         .iter()
                         .map(|(_, n, busy)| format!("{n} ({busy} busy)"))
                         .collect();
-                    println!("* {model}: {}", list.join(", "));
+                    say!("* {model}: {}", list.join(", "));
                 }
             }
             Some("/ask") => {
@@ -471,12 +478,12 @@ impl Node {
             Some("/pin") => {
                 let who = words.next().context("usage: /pin <nick>")?;
                 let on = self.toggle(who, |st| &mut st.room.local.pinned)?;
-                println!("* {who} {}", if on { "pinned" } else { "unpinned" });
+                say!("* {who} {}", if on { "pinned" } else { "unpinned" });
             }
             Some("/block") => {
                 let who = words.next().context("usage: /block <nick>")?;
                 let on = self.toggle(who, |st| &mut st.room.local.blocked)?;
-                println!("* {who} {}", if on { "blocked" } else { "unblocked" });
+                say!("* {who} {}", if on { "blocked" } else { "unblocked" });
             }
             Some("/token") => {
                 let app = words.next().context("usage: /token <app>")?;
@@ -484,7 +491,7 @@ impl Node {
                 let st = &mut *self.lock();
                 st.room.local.tokens.insert(app.into(), token.clone());
                 self.save(st);
-                println!("* token {app} {token}");
+                say!("* token {app} {token}");
             }
             Some(w) if w.starts_with('/') => bail!("unknown command {w}"),
             Some(_) => {
@@ -504,25 +511,26 @@ impl Node {
     }
 }
 
-/// Runs a room node until stdin closes or `/quit`.
+/// Runs a room node until the user quits.
 pub async fn run(
     key: Keypair,
     path: PathBuf,
     room: Room,
     wire: Wire,
-    online: HashSet<PeerId>,
-    addrs: BTreeSet<Multiaddr>,
     api: SocketAddr,
+    mode: ui::Mode,
 ) -> Result<()> {
     let Wire {
         mut control,
         cmds,
         mut events,
+        online,
+        addrs,
     } = wire;
     let me = key.public().to_peer_id();
     let mut incoming = control.accept(PROTOCOL)?;
     let mut asks = control.accept(infer::ASK)?;
-    println!(
+    say!(
         "* in {} as {}",
         room.name(),
         room.members()
@@ -573,7 +581,25 @@ pub async fn run(
     });
     tokio::spawn(infer::api(node.clone(), api));
     let mut tick = tokio::time::interval(infer::BEAT_EVERY);
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let n = node.clone();
+    let mut input = ui::input(mode, move || {
+        let models = n.online_models().into_iter().map(|(model, providers)| {
+            let nicks: Vec<_> = providers.into_iter().map(|(_, nick, _)| nick).collect();
+            format!("{model}: {}", nicks.join(", "))
+        });
+        let st = n.lock();
+        let (owner, members) = (st.room.owner(), st.room.members());
+        ui::Sidebar {
+            room: st.room.name(),
+            nick: members.get(&n.me).cloned().unwrap_or_default(),
+            members: members
+                .into_iter()
+                .map(|(p, nick)| (nick, p == owner, p == n.me || st.online.contains(&p)))
+                .collect(),
+            models: models.collect(),
+            addrs: st.addrs.len(),
+        }
+    });
     loop {
         tokio::select! {
             ev = events.recv() => match ev.context("network stopped")? {
@@ -589,7 +615,7 @@ pub async fn run(
                     node.dial_members(st); // ponytail: one redial per drop; add backoff retries if links flap
                 }
                 Net::Addr(a) => {
-                    println!("* listening {a}");
+                    ui::script_only(format!("* listening {a}"));
                     node.lock().addrs.insert(a);
                 }
             },
@@ -604,14 +630,14 @@ pub async fn run(
                     node.beat();
                 }
             }
-            line = stdin.next_line() => match line? {
+            line = input.recv() => match line {
                 None => return Ok(()),
                 Some(line) => {
                     let before = node.lock().room.local.shares.len();
                     match node.command(line.trim()) {
                         Ok(true) => return Ok(()),
                         Ok(false) => {}
-                        Err(e) => println!("* {e:#}"),
+                        Err(e) => say!("* {e:#}"),
                     }
                     // Announce share changes now, not at the next tick.
                     if node.lock().room.local.shares.len() != before {
@@ -631,6 +657,7 @@ pub async fn join(
     nick: String,
     swarm: Swarm<Behaviour>,
     api: SocketAddr,
+    mode: ui::Mode,
 ) -> Result<()> {
     let Event::Invite { room: room_id, .. } = ticket.invite.open()? else {
         bail!("ticket holds no invite")
@@ -649,12 +676,11 @@ pub async fn join(
     for (p, addrs) in &bootstrap {
         let _ = wire.cmds.send(Cmd::Dial(*p, addrs.clone()));
     }
-    let (mut online, mut addrs) = (HashSet::new(), BTreeSet::new());
     let room = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             match wire.events.recv().await.context("network stopped")? {
                 Net::Up(p) => {
-                    online.insert(p);
+                    wire.online.insert(p);
                     if !bootstrap.contains_key(&p) {
                         continue;
                     }
@@ -677,14 +703,14 @@ pub async fn join(
                             return Ok(room);
                         }
                         Ok(Some(Msg::Denied { reason })) => bail!("join refused: {reason}"),
-                        _ => println!("* join via {p} failed, waiting for another member"),
+                        _ => say!("* join via {p} failed, waiting for another member"),
                     }
                 }
                 Net::Down(p) => {
-                    online.remove(&p);
+                    wire.online.remove(&p);
                 }
                 Net::Addr(a) => {
-                    addrs.insert(a);
+                    wire.addrs.insert(a);
                 }
             }
         }
@@ -692,5 +718,5 @@ pub async fn join(
     .await
     .context("no member reachable from the ticket")??;
     let path = rooms.join(format!("{}.json", room.id));
-    run(key, path, room, wire, online, addrs, api).await
+    run(key, path, room, wire, api, mode).await
 }
