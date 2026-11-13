@@ -139,8 +139,17 @@ pub struct Share {
     pub max_tokens: Option<u64>,
 }
 
+fn valid_nick(nick: &str) -> bool {
+    !nick.is_empty()
+        && nick.chars().count() <= 32
+        && nick
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl Room {
     pub fn create(key: &Keypair, name: &str, nick: &str) -> Result<Self> {
+        ensure!(valid_nick(nick), "nick must be 1-32 letters, digits, - _ .");
         let genesis = Signed::new(
             key,
             &Event::Genesis {
@@ -256,9 +265,18 @@ impl Room {
 
     /// Door checks the admitting member runs on top of `check`.
     pub fn admit(&self, join: &Signed) -> Result<()> {
-        let Event::Join { invite, .. } = join.open()? else {
+        let Event::Join { invite, nick, .. } = join.open()? else {
             bail!("not a join")
         };
+        let lower = nick.to_lowercase();
+        ensure!(
+            valid_nick(&nick)
+                && !self
+                    .members()
+                    .iter()
+                    .any(|(p, n)| *p != join.by && n.to_lowercase() == lower),
+            "nick is taken or invalid (letters, digits, - _ .)"
+        );
         let Event::Invite {
             invitee,
             uses,
@@ -434,5 +452,33 @@ mod tests {
         room.admit(&j).unwrap();
         room.add(j).unwrap();
         assert!(room.is_member(&bob_id));
+
+        // Nicks: unique among members, no spaces.
+        let inv = invite(&owner, &room, None, 5, now() + 60);
+        assert!(
+            room.admit(&join(&eve, &room, "alice", &inv)).is_err(),
+            "nick taken"
+        );
+        assert!(
+            room.admit(&join(&eve, &room, "ALICE", &inv)).is_err(),
+            "nick taken, other case"
+        );
+        assert!(Room::create(&owner, "r", "a b").is_err(), "owner nick");
+        assert!(
+            room.admit(&join(&eve, &room, "e ve", &inv)).is_err(),
+            "nick with space"
+        );
+        room.admit(&join(&eve, &room, "eve", &inv)).unwrap();
+
+        // A revoked invite no longer admits.
+        let revoke = Event::Revoke {
+            room: room.id.clone(),
+            invite: inv.id(),
+        };
+        room.add(Signed::new(&owner, &revoke).unwrap()).unwrap();
+        assert!(
+            room.admit(&join(&eve, &room, "eve", &inv)).is_err(),
+            "revoked"
+        );
     }
 }

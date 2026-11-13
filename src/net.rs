@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, dcutr, identify,
+    Multiaddr, Swarm, connection_limits, dcutr, identify,
     identity::Keypair,
     multiaddr::Protocol,
     noise, ping, relay,
@@ -26,6 +26,8 @@ pub struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
+    // Idle connections live an hour, so cap how many strangers can hold open.
+    limits: connection_limits::Behaviour,
 }
 
 /// Loads the identity key, creating it (mode 0600) on first run.
@@ -67,6 +69,9 @@ pub fn swarm(key: Keypair) -> Result<Swarm<Behaviour>> {
                         // Completions outlive the 2 min / 128 KiB defaults.
                         max_circuit_duration: Duration::from_secs(3600),
                         max_circuit_bytes: 0,
+                        // Defaults (16 total, 4 per peer) split a room behind one relay.
+                        max_circuits: 1024,
+                        max_circuits_per_peer: 64,
                         ..Default::default()
                     },
                 ),
@@ -78,6 +83,10 @@ pub fn swarm(key: Keypair) -> Result<Swarm<Behaviour>> {
                 )),
                 ping: ping::Behaviour::default(),
                 stream: libp2p_stream::Behaviour::new(),
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_established_incoming(Some(256)),
+                ),
             }
         })?
         .with_swarm_config(|c| // Room members stay connected without traffic.

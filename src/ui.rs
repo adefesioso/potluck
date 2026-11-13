@@ -17,6 +17,11 @@ static SINK: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
 
 /// Prints a status or chat line: into the TUI when it runs, else to stdout.
 pub fn say(line: String) {
+    let line: String = line
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
     match SINK.get() {
         Some(tx) => {
             let _ = tx.send(line);
@@ -54,6 +59,7 @@ pub fn mode() -> Mode {
 /// Leaves the TUI's alternate screen, if it was entered.
 pub fn restore() {
     if SINK.get().is_some() {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -87,6 +93,7 @@ pub fn input(
         }),
         Mode::Tui(out) => tokio::spawn(async move {
             let result = tui(out, tx, sidebar).await;
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
             ratatui::restore();
             if let Err(e) = result {
                 eprintln!("tui: {e}");
@@ -102,6 +109,7 @@ async fn tui(
     sidebar: impl Fn() -> Sidebar,
 ) -> std::io::Result<()> {
     let mut term = ratatui::init();
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let mut app = App::default();
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1)); // sidebar refresh
@@ -110,12 +118,21 @@ async fn tui(
         term.draw(|f| app.draw(f, &side))?;
         tokio::select! {
             Some(line) = out.recv() => {
+                let before = app.lines.len();
                 app.lines.push(line);
                 while let Ok(line) = out.try_recv() {
                     app.lines.push(line);
                 }
+                if app.scroll > 0 {
+                    app.scroll += app.lines.len() - before;
+                }
             }
-            Some(Ok(Event::Key(key))) = keys.next() => {
+            Some(Ok(event)) = keys.next() => {
+                if let Event::Paste(s) = &event {
+                    app.paste(s);
+                    continue;
+                }
+                let Event::Key(key) = event else { continue };
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -138,6 +155,8 @@ async fn tui(
                             return Ok(());
                         }
                     }
+                    KeyCode::Char(_)
+                        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
                     code => app.edit(code),
                 }
             }
@@ -159,6 +178,15 @@ struct App {
 }
 
 impl App {
+    /// A bracketed paste is one insertion; line breaks and tabs become spaces.
+    fn paste(&mut self, s: &str) {
+        for c in s.chars() {
+            let c = if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c };
+            self.input.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+    }
+
     fn edit(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char(c) => {
@@ -176,6 +204,8 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
+            KeyCode::Up if self.recall == 0 => {}
+            KeyCode::Down if self.recall >= self.history.len() => {}
             KeyCode::Up | KeyCode::Down => {
                 self.recall = match code {
                     KeyCode::Up => self.recall.saturating_sub(1),
@@ -254,8 +284,10 @@ impl App {
         );
 
         let text: String = self.input.iter().collect();
-        f.render_widget(Paragraph::new(format!("> {text}")), input);
-        f.set_cursor_position((input.x + 2 + self.cursor as u16, input.y));
+        let cur = u16::try_from(2 + self.cursor).unwrap_or(u16::MAX);
+        let off = cur.saturating_sub(input.width.saturating_sub(1));
+        f.render_widget(Paragraph::new(format!("> {text}")).scroll((0, off)), input);
+        f.set_cursor_position((input.x + cur - off, input.y));
     }
 
     /// Newest messages at the bottom; wraps long lines (tickets break mid-word).
@@ -324,6 +356,9 @@ mod tests {
         app.edit(KeyCode::Down);
         app.edit(KeyCode::Down);
         assert!(app.input.is_empty());
+        app.paste("a\nb");
+        assert_eq!(app.input.iter().collect::<String>(), "a b");
+        assert_eq!(app.cursor, 3);
     }
 
     #[test]

@@ -1,71 +1,15 @@
 //! Phase 2 exit check: an OpenAI client on alice's machine uses a model bob shares.
 
+mod common;
+
+use common::{potluck, Peer};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
-
-struct Peer {
-    child: Child,
-    stdin: ChildStdin,
-    lines: mpsc::Receiver<String>,
-}
-
-impl Drop for Peer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
-}
-
-impl Peer {
-    fn spawn(dir: &Path, args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_potluck"))
-            .arg("--dir")
-            .arg(dir)
-            .args(args)
-            .args(["--api", "127.0.0.1:0"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for l in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = tx.send(l);
-            }
-        });
-        let stdin = child.stdin.take().unwrap();
-        Self {
-            child,
-            stdin,
-            lines,
-        }
-    }
-
-    fn say(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
-    }
-
-    /// Next line containing `pat`, skipping others.
-    fn expect(&mut self, pat: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while let Ok(l) = self
-            .lines
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            if l.contains(pat) {
-                return l;
-            }
-        }
-        panic!("timed out waiting for {pat:?}");
-    }
-}
 
 /// OpenAI-style backend: streams "Hel","lo" or returns one JSON body; reports each request body.
 fn fake_backend() -> (String, mpsc::Receiver<String>) {
@@ -112,7 +56,10 @@ fn fake_backend() -> (String, mpsc::Receiver<String>) {
 fn http(port: &str, path: &str, headers: &[&str], body: Option<&str>) -> (u16, String, String) {
     let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
     let method = if body.is_some() { "POST" } else { "GET" };
-    let mut req = format!("{method} {path} HTTP/1.0\r\nhost: 127.0.0.1:{port}\r\n");
+    let mut req = format!("{method} {path} HTTP/1.0\r\n");
+    if !headers.iter().any(|h| h.starts_with("host:")) {
+        req += &format!("host: 127.0.0.1:{port}\r\n");
+    }
     for h in headers {
         req += &format!("{h}\r\n");
     }
@@ -140,9 +87,7 @@ fn ide_uses_a_room_model() {
     let root = std::env::temp_dir().join(format!("potluck-p2-{}", std::process::id()));
     let (backend, seen) = fake_backend();
 
-    let created = Command::new(env!("CARGO_BIN_EXE_potluck"))
-        .arg("--dir")
-        .arg(root.join("alice"))
+    let created = potluck(&root.join("alice"))
         .args(["create", "friends", "--nick", "alice"])
         .output()
         .unwrap();
@@ -173,7 +118,10 @@ fn ide_uses_a_room_model() {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         alice.say("/models");
-        if alice.expect("* ").starts_with("* m: bob") {
+        if alice
+            .try_expect("* m: bob", Duration::from_millis(500))
+            .is_some()
+        {
             break;
         }
         assert!(Instant::now() < deadline, "bob's share never showed up");
@@ -212,6 +160,17 @@ fn ide_uses_a_room_model() {
         .0,
         403
     );
+    // DNS rebinding: a non-loopback Host is refused even with a valid token.
+    assert_eq!(
+        http(
+            &port,
+            &format!("{base}/models"),
+            &[&auth, "host: evil.example"],
+            None
+        )
+        .0,
+        403
+    );
     let (status, _, body) = http(&port, &format!("{base}/models"), &[&auth], None);
     assert_eq!(status, 200);
     assert!(body.contains("\"id\":\"m\""), "{body}");
@@ -243,23 +202,49 @@ fn ide_uses_a_room_model() {
     let other = r#"{"model":"nope","messages":[]}"#;
     assert_eq!(http(&port, &completions, &[&auth], Some(other)).0, 503);
 
+    // A body of 1 MiB or more is refused locally, before any provider is contacted.
+    let big = format!(
+        r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "a".repeat(1100 * 1024)
+    );
+    let (status, _, body) = http(&port, &completions, &[&auth], Some(&big));
+    assert_eq!(status, 413);
+    assert!(body.contains("too large"), "{body}");
+
     // The REPL asks too, and bob logs who used his GPU.
     alice.say("/ask m hi there");
     alice.expect("<m@bob> Hello");
     seen.recv().unwrap();
-    let log = std::fs::read_to_string(root.join("bob/requests.log")).unwrap();
+    // Bob logs after closing the stream, so poll until the line lands.
+    let count = |log: &str| log.lines().filter(|l| l.ends_with(" alice m 200")).count();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = std::fs::read_to_string(root.join("bob/requests.log")).unwrap_or_default();
+        if count(&log) >= 3 || Instant::now() >= deadline {
+            break log;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(count(&log), 3, "{log}");
+
+    // Bob lowers the per-minute limit to 4: alice has used 3, so one more passes, then she is refused.
+    bob.say(&format!("/share m http://{backend} 1 4 5"));
+    bob.expect("* sharing m");
     assert_eq!(
-        log.lines().filter(|l| l.ends_with(" alice m 200")).count(),
-        3,
-        "{log}"
+        http(&port, &completions, &[&auth], Some(&req(false))).0,
+        200
     );
+    seen.recv().unwrap();
+    let (status, _, body) = http(&port, &completions, &[&auth], Some(&req(false)));
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("rate limit"), "{body}");
 
     // Bob blocks alice: his GPU refuses her.
     bob.say("/block alice");
     bob.expect("* alice blocked");
     assert_eq!(
         http(&port, &completions, &[&auth], Some(&req(false))).0,
-        403
+        503
     );
 
     let _ = std::fs::remove_dir_all(root);

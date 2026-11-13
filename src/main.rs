@@ -7,6 +7,7 @@ mod room;
 use std::{
     fs,
     net::SocketAddr,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -72,6 +73,9 @@ async fn main() -> Result<()> {
     });
     let rooms = dir.join("rooms");
     fs::create_dir_all(&rooms)?;
+    if let Err(e) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+        eprintln!("* can't make {} private: {e}", dir.display());
+    }
     let key = net::load_key(&dir.join("key"))?;
     let mut swarm = net::swarm(key.clone())?;
     let me = *swarm.local_peer_id();
@@ -124,7 +128,19 @@ fn find_room(rooms: &Path, query: &str) -> Result<(PathBuf, room::Room)> {
     let mut found = Vec::new();
     for entry in fs::read_dir(rooms)? {
         let path = entry?.path();
-        let room: room::Room = serde_json::from_slice(&fs::read(&path)?)?;
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let parsed = fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| Ok(serde_json::from_slice::<room::Room>(&b)?));
+        let room = match parsed {
+            Ok(room) => room,
+            Err(e) => {
+                eprintln!("* skipping {}: {e}", path.display());
+                continue;
+            }
+        };
         if room.name() == query || room.id.starts_with(query) {
             found.push((path, room));
         }

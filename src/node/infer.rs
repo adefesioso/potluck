@@ -22,7 +22,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use futures::{
-    AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, StreamExt,
+    AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, StreamExt, TryStreamExt,
     io::{AsyncRead, BufReader},
 };
 use libp2p::{PeerId, Stream, StreamProtocol};
@@ -117,7 +117,8 @@ impl Node {
         let mut models: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (p, b) in &st.beats {
             let Some(nick) = members.get(p) else { continue };
-            if b.at.elapsed() < FRESH && st.online.contains(p) {
+            if b.at.elapsed() < FRESH && st.online.contains(p) && !st.room.local.blocked.contains(p)
+            {
                 for m in &b.models {
                     models
                         .entry(m.clone())
@@ -129,7 +130,7 @@ impl Node {
         models
     }
 
-    /// `online_models` plus our own shares, for display; routing never picks us.
+    /// `online_models` plus our own shares; `route` serves those from the local backend.
     pub(super) fn listed_models(&self) -> BTreeMap<String, Vec<(PeerId, String, u32)>> {
         let mut models = self.online_models();
         let st = self.lock();
@@ -148,7 +149,6 @@ impl Node {
     fn providers(&self, model: &str) -> Vec<(PeerId, String)> {
         let mut found = self.online_models().remove(model).unwrap_or_default();
         let st = self.lock();
-        found.retain(|(p, _, _)| !st.room.local.blocked.contains(p));
         found.sort_by_key(|(p, _, busy)| (!st.room.local.pinned.contains(p), *busy));
         found.into_iter().map(|(p, nick, _)| (p, nick)).collect()
     }
@@ -157,17 +157,72 @@ impl Node {
     pub(super) async fn route(
         &self,
         body: &Value,
-    ) -> Result<(String, Head, impl AsyncRead + Unpin + Send + 'static)> {
+    ) -> Result<(String, Head, Box<dyn AsyncRead + Unpin + Send>)> {
         let model = body["model"].as_str().context("request has no model")?;
         let req = serde_json::to_vec(body)?;
+        // Every provider refuses this; refusing here avoids writing into a stream it already dropped.
+        if req.len() as u64 >= MAX_REQUEST {
+            let head = Head {
+                status: 413,
+                error: Some("request too large (1 MiB limit)".into()),
+            };
+            let empty: Box<dyn AsyncRead + Unpin + Send> = Box::new(futures::io::empty());
+            return Ok((String::from("potluck"), head, empty));
+        }
         let mut last = anyhow!("no provider online for {model}");
-        for (peer, nick) in self.providers(model) {
-            match self.try_provider(peer, &req).await {
-                Ok((head, _)) if matches!(head.status, 429 | 503) => {
-                    last = anyhow!("{nick}: {}", head.error.unwrap_or_default());
+        let own = {
+            let st = self.lock();
+            let nick = st.room.members().get(&self.me).cloned().unwrap_or_default();
+            let backend = st.room.local.shares.get(model).map(|s| s.backend.clone());
+            backend.map(|b| (b, nick))
+        };
+        if let Some((backend, nick)) = own {
+            // shortcut: own requests skip the share's limits and busy count; route them through take_slot if owners want that.
+            let url = format!("{}/v1/chat/completions", backend.trim_end_matches('/'));
+            let sent = self
+                .http
+                .post(url)
+                .header("content-type", "application/json")
+                .body(req.clone())
+                .send()
+                .await;
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = Box::pin(resp.bytes_stream().map_err(std::io::Error::other));
+                    let head = Head {
+                        status,
+                        error: None,
+                    };
+                    let body: Box<dyn AsyncRead + Unpin + Send> = Box::new(body.into_async_read());
+                    return Ok((nick, head, body));
                 }
-                Ok((head, body)) => return Ok((nick, head, body)),
-                Err(e) => last = e.context(format!("{nick} unreachable")),
+                Err(e) => {
+                    last = anyhow::Error::new(e.without_url())
+                        .context(format!("{nick} backend unreachable"))
+                }
+            }
+        }
+        for (peer, nick) in self.providers(model) {
+            // The head waits for the backend's first byte, so this matches the backend read timeout.
+            let tried =
+                tokio::time::timeout(Duration::from_secs(600), self.try_provider(peer, &req)).await;
+            match tried {
+                // Provider refusals carry `error`; backend replies never do.
+                // 400/413 would fail the same on every provider, so they go straight back;
+                // a backend's own 429/503 (busy) is worth another provider.
+                Ok(Ok((head, _)))
+                    if (head.error.is_some() && !matches!(head.status, 400 | 413))
+                        || matches!(head.status, 429 | 503) =>
+                {
+                    last = match head.error {
+                        Some(error) => anyhow!("{nick}: {error}"),
+                        None => anyhow!("{nick}: backend answered {}", head.status),
+                    };
+                }
+                Ok(Ok((head, body))) => return Ok((nick, head, Box::new(body) as _)),
+                Ok(Err(e)) => last = e.context(format!("{nick} unreachable")),
+                Err(_) => last = anyhow!("{nick} timed out"),
             }
         }
         Err(last)
@@ -188,12 +243,29 @@ impl Node {
 
     /// Provider side of `/potluck/ask/1`.
     pub(super) async fn provide(self: Arc<Self>, peer: PeerId, mut stream: Stream) {
+        // Refuse strangers and blocked members before buffering anything from them.
+        let refused = {
+            let st = self.lock();
+            !st.room.is_member(&peer) || st.room.local.blocked.contains(&peer)
+        };
+        if refused {
+            let _ = write_head(&mut stream, 403, Some("not allowed".into())).await;
+            let _ = stream.close().await;
+            return; // not logged: strangers could grow the log without limit
+        }
         let mut body = Vec::new();
-        let read = (&mut stream).take(MAX_REQUEST).read_to_end(&mut body).await;
+        let read = tokio::time::timeout(
+            Duration::from_secs(30),
+            (&mut stream).take(MAX_REQUEST).read_to_end(&mut body),
+        )
+        .await;
         let mut req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let model = req["model"].as_str().unwrap_or_default().to_owned();
         let checked = match read {
-            Ok(_) if req.is_object() => self.take_slot(peer, &model),
+            Ok(Ok(_)) if body.len() as u64 == MAX_REQUEST => {
+                Err((413, "request too large (1 MiB limit)".into()))
+            }
+            Ok(Ok(_)) if req.is_object() => self.take_slot(peer, &model),
             _ => Err((400, "bad request".into())),
         };
         let status = match checked {
@@ -247,16 +319,17 @@ impl Node {
         model: &str,
     ) -> u16 {
         if let Some(cap) = share.max_tokens {
-            let mut capped = false;
-            for k in ["max_tokens", "max_completion_tokens"] {
-                if let Some(v) = req[k].as_u64() {
-                    req[k] = v.min(cap).into();
-                    capped = true;
-                }
+            let asked = ["max_tokens", "max_completion_tokens"]
+                .iter()
+                .filter_map(|k| req[*k].as_u64())
+                .min();
+            // max_tokens only, one completion: no other field (n, n_predict, ...) can skip the cap.
+            if let Some(o) = req.as_object_mut() {
+                o.remove("max_completion_tokens");
+                o.remove("n");
+                o.remove("n_predict");
             }
-            if !capped {
-                req["max_tokens"] = cap.into();
-            }
+            req["max_tokens"] = asked.map_or(cap, |v| v.min(cap)).into();
         }
         let url = format!(
             "{}/v1/chat/completions",
@@ -272,7 +345,8 @@ impl Node {
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
-                let _ = write_head(stream, 502, Some(format!("backend unreachable: {e}"))).await;
+                let error = format!("backend unreachable: {}", e.without_url());
+                let _ = write_head(stream, 502, Some(error)).await;
                 return 502;
             }
         };
@@ -288,8 +362,19 @@ impl Node {
                     .await;
                 break;
             }
-            let Ok(chunk) = chunk else { break };
-            if stream.write_all(&chunk).await.is_err() || stream.flush().await.is_err() {
+            let Ok(chunk) = chunk else {
+                let _ = stream
+                    .write_all(b"\n\ndata: {\"error\":{\"message\":\"backend error\"}}\n\n")
+                    .await;
+                break;
+            };
+            // A requester that stops reading must not hold the slot forever.
+            let wrote = tokio::time::timeout(Duration::from_secs(60), async {
+                stream.write_all(&chunk).await?;
+                stream.flush().await
+            })
+            .await;
+            if !matches!(wrote, Ok(Ok(()))) {
                 break;
             }
         }
@@ -304,24 +389,32 @@ impl Node {
             .get(&peer)
             .cloned()
             .unwrap_or_else(|| peer.to_string());
+        // Members choose the model name: no forged lines, no 1 MiB entries.
+        let model: String = model.chars().filter(|c| !c.is_control()).take(128).collect();
         let line = format!("{} {nick} {model} {status}\n", now());
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path);
         if let Err(e) = file.and_then(|mut f| f.write_all(line.as_bytes())) {
-            eprintln!("* can't write request log: {e}");
+            say!("* can't write request log: {e}");
         }
     }
 
-    /// `/ask` from the REPL: prints the whole answer as one line when it's done.
+    /// `/ask` from the REPL: prints the whole answer when it's done.
     pub(super) fn ask(self: &Arc<Self>, model: String, prompt: String) {
         let node = self.clone();
         tokio::spawn(async move {
             let body = json!({"model": model, "stream": true, "messages": [{"role": "user", "content": prompt}]});
             match node.route(&body).await {
                 Ok((nick, Head { status: 200, .. }, body)) => match read_sse(body).await {
-                    Ok(text) => say!("<{model}@{nick}> {text}"),
+                    Ok(text) => {
+                        let mut lines = text.lines();
+                        say!("<{model}@{nick}> {}", lines.next().unwrap_or_default());
+                        for line in lines {
+                            say!("{line}");
+                        }
+                    }
                     Err(e) => say!("* {nick}: {e:#}"),
                 },
                 Ok((nick, Head { status, error }, _)) => {
@@ -443,7 +536,7 @@ async fn guard(
 
 async fn models(State(node): State<Arc<Node>>) -> Json<Value> {
     let data: Vec<_> = node
-        .online_models()
+        .listed_models()
         .into_keys()
         .map(|id| json!({"id": id, "object": "model", "owned_by": "potluck"}))
         .collect();

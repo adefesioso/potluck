@@ -1,100 +1,9 @@
 //! Phase 1 exit check: 5 people chat in one room; a removed member is locked out.
 
-use std::{
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+mod common;
 
-struct Peer {
-    child: Child,
-    stdin: ChildStdin,
-    lines: mpsc::Receiver<String>,
-    /// Lines seen; `log[..used]` were consumed by `expect`.
-    log: Vec<String>,
-    used: usize,
-}
-
-impl Drop for Peer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
-}
-
-fn potluck(dir: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_potluck"));
-    cmd.arg("--dir").arg(dir);
-    cmd
-}
-
-impl Peer {
-    fn spawn(dir: &Path, args: &[&str]) -> Self {
-        let mut child = potluck(dir)
-            .args(args)
-            .args(["--api", "127.0.0.1:0"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for l in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = tx.send(l);
-            }
-        });
-        let stdin = child.stdin.take().unwrap();
-        Self {
-            child,
-            stdin,
-            lines,
-            log: Vec::new(),
-            used: 0,
-        }
-    }
-
-    fn say(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
-    }
-
-    /// Waits for an unconsumed line containing `pat` and consumes it.
-    fn expect(&mut self, pat: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(i) = (self.used..self.log.len()).find(|&i| self.log[i].contains(pat)) {
-                self.log.swap(self.used, i);
-                self.used += 1;
-                return self.log[self.used - 1].clone();
-            }
-            match self
-                .lines
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
-                Ok(l) => self.log.push(l),
-                Err(_) => break,
-            }
-        }
-        panic!("timed out waiting for {pat:?}; saw {:#?}", self.log);
-    }
-
-    /// Collects whatever arrives within `d`.
-    fn settle(&mut self, d: Duration) {
-        let deadline = Instant::now() + d;
-        while let Ok(l) = self
-            .lines
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            self.log.push(l);
-        }
-    }
-
-    fn saw(&self, pat: &str) -> bool {
-        self.log.iter().any(|l| l.contains(pat))
-    }
-}
+use common::{potluck, Peer};
+use std::{path::PathBuf, time::Duration};
 
 #[test]
 fn five_chat_and_removed_member_is_locked_out() {
@@ -107,8 +16,13 @@ fn five_chat_and_removed_member_is_locked_out() {
         .unwrap();
     assert!(out.status.success());
     let mut room = vec![Peer::spawn(&dir("alice"), &["chat", "friends"])];
-    room[0].expect("* listening /ip4/127.0.0.1/tcp/");
+    let alice_addr = room[0]
+        .expect("* listening /ip4/127.0.0.1/tcp/")
+        .trim_start_matches("* listening ")
+        .trim()
+        .to_owned();
 
+    let mut erin_ticket = String::new();
     for nick in ["bob", "carol", "dave", "erin"] {
         room[0].say("/invite");
         let ticket = room[0]
@@ -117,7 +31,13 @@ fn five_chat_and_removed_member_is_locked_out() {
             .nth(3)
             .unwrap()
             .to_owned();
-        let mut p = Peer::spawn(&dir(nick), &["join", &ticket, "--nick", nick]);
+        // Guards: a joiner dialing a relay that is itself a member (alice) must still reach the room.
+        let mut args = vec!["join", ticket.as_str(), "--nick", nick];
+        if nick == "erin" {
+            args.extend(["--relay", alice_addr.as_str()]);
+            erin_ticket = ticket.clone();
+        }
+        let mut p = Peer::spawn(&dir(nick), &args);
         p.expect(&format!("* in friends as {nick}"));
         for m in &mut room {
             m.expect(&format!("* {nick} joined"));
@@ -177,6 +97,13 @@ fn five_chat_and_removed_member_is_locked_out() {
         !room[1].saw("<carol> after"),
         "removed member still reads the room"
     );
+
+    // A lost join reply: erin loses her room file and gets back in with the same ticket.
+    // Last, because members may keep her dead connection for a while and miss-send to it.
+    drop(room.pop());
+    std::fs::remove_dir_all(dir("erin").join("rooms")).unwrap();
+    Peer::spawn(&dir("erin"), &["join", &erin_ticket, "--nick", "erin"])
+        .expect("* in friends as erin");
 
     let _ = std::fs::remove_dir_all(root);
 }
