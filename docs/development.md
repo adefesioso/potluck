@@ -2,7 +2,7 @@
 
 ## Stack
 
-- Rust: rust-libp2p (TCP/QUIC, Noise, Yamux, relay, DCUtR), tokio, axum (endpoint), ratatui (TUI).
+- Rust 1.88+, Linux and macOS only: rust-libp2p (TCP/QUIC, Noise, Yamux, relay, DCUtR), tokio, axum (endpoint), ratatui (TUI).
 - JSON wire messages and per-room JSON files ([protocol.md](protocol.md)).
 - Inference backends: any OpenAI-compatible HTTP server (llama.cpp server, vLLM, Ollama, LM Studio).
 
@@ -23,4 +23,5 @@
 |---|---|
 | `tests/phase1.rs` | five members chat; a removed member is locked out |
 | `tests/phase2.rs` | an OpenAI client uses a member's model through the endpoint |
+| `tests/common/mod.rs` | shared harness for the integration tests |
 | `tests/lab.sh` | on a pvelab Proxmox node: two members behind separate NATs join, chat, and share via relay |

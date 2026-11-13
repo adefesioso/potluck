@@ -16,6 +16,7 @@ Each item ships when its trigger shows up in real use.
 
 | Feature | Trigger |
 |---|---|
+| Members as relays | rooms without a host to run `potluck relay` |
 | Ops and co-owners (needs causal event ordering) | one owner can't keep up with invites and removals |
 | MLS group encryption | rooms grow past ~50 members |
 | Model verification | rooms form among people who don't know each other |

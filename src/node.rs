@@ -5,6 +5,7 @@ mod infer;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
+    io::Write,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -83,6 +84,10 @@ pub fn spawn_swarm(mut swarm: Swarm<Behaviour>) -> Wire {
     for a in swarm.listeners() {
         let _ = ev_tx.send(Net::Addr(a.clone().with_p2p(me).unwrap_or_else(|a| a)));
     }
+    // Likewise peers connected before (e.g. the relay), whose ConnectionEstablished `listen` consumed.
+    for p in swarm.connected_peers() {
+        let _ = ev_tx.send(Net::Up(*p));
+    }
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -129,9 +134,9 @@ async fn write(s: &mut Stream, msg: &Msg) -> Result<()> {
     Ok(s.close().await?) // half-close: the reader reads to EOF
 }
 
-async fn read(s: &mut Stream) -> Result<Option<Msg>> {
+async fn read(s: &mut Stream, cap: u64) -> Result<Option<Msg>> {
     let mut buf = Vec::new();
-    (&mut *s).take(MAX_MSG).read_to_end(&mut buf).await?;
+    (&mut *s).take(cap).read_to_end(&mut buf).await?;
     if buf.is_empty() {
         return Ok(None);
     }
@@ -141,7 +146,7 @@ async fn read(s: &mut Stream) -> Result<Option<Msg>> {
 async fn send(mut control: Control, peer: PeerId, msg: &Msg) -> Result<Option<Msg>> {
     let mut s = control.open_stream(peer, PROTOCOL).await?;
     write(&mut s, msg).await?;
-    read(&mut s).await
+    read(&mut s, MAX_MSG).await
 }
 
 fn by_peer(addrs: impl IntoIterator<Item = Multiaddr>) -> HashMap<PeerId, Vec<Multiaddr>> {
@@ -184,8 +189,16 @@ impl Node {
     }
 
     fn save(&self, st: &State) {
-        if let Err(e) = fs::write(&self.path, serde_json::to_vec(&st.room).unwrap()) {
-            eprintln!("* can't save room: {e}");
+        // Write, sync, then rename, so a kill or power loss can't leave a half-written room file.
+        let tmp = self.path.with_extension("json.tmp");
+        let res = fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(&serde_json::to_vec(&st.room).unwrap())?;
+                f.sync_all()
+            })
+            .and_then(|()| fs::rename(&tmp, &self.path));
+        if let Err(e) = res {
+            say!("* can't save room: {e}");
         }
     }
 
@@ -203,9 +216,10 @@ impl Node {
     }
 
     fn online_members(&self, st: &State) -> Vec<PeerId> {
+        let members = st.room.members();
         st.online
             .iter()
-            .filter(|p| st.room.is_member(p))
+            .filter(|p| members.contains_key(*p))
             .copied()
             .collect()
     }
@@ -227,8 +241,26 @@ impl Node {
             changed |= st.room.add(e).unwrap_or(false);
         }
         let mut new_peers = false;
+        // A peer's own list of its addresses replaces what we stored for it.
+        if let Some(f) = from {
+            let stale = {
+                let ours = Some(Protocol::P2p(f));
+                let of_f = |a: &&Multiaddr| a.iter().last() == ours;
+                let fresh: BTreeSet<_> = peers.iter().filter(of_f).collect();
+                let old: BTreeSet<_> = st.room.peers.iter().filter(of_f).collect();
+                !fresh.is_empty() && fresh != old
+            };
+            if stale {
+                st.room.peers.retain(|a| a.iter().last() != Some(Protocol::P2p(f)));
+                new_peers = true;
+            }
+        }
+        // Third parties only tell us about peers we aren't connected to; once such a peer
+        // connects, its own list (above) replaces whatever stale addresses came this way.
         for a in peers {
-            if matches!(a.iter().last(), Some(Protocol::P2p(p)) if p != self.me) {
+            if matches!(a.iter().last(), Some(Protocol::P2p(p))
+                if p != self.me && (Some(p) == from || !st.online.contains(&p)))
+            {
                 new_peers |= st.room.peers.insert(a);
             }
         }
@@ -275,15 +307,17 @@ impl Node {
     fn cast(self: &Arc<Self>, from: PeerId, signed: Signed) {
         let st = &mut *self.lock();
         let Ok(event) = signed.open() else { return };
-        let Some(nick) = st.room.members().get(&signed.by).cloned() else {
-            return;
-        };
         let (Event::Chat { room, .. } | Event::Heartbeat { room, .. }) = &event else {
             return;
         };
-        if *room != st.room.id || st.seen.insert(signed.id(), Instant::now()).is_some() {
+        if *room != st.room.id || st.seen.contains_key(&signed.id()) {
             return;
         }
+        // Mark seen only once the signer is a member, so a message racing its join can come again.
+        let Some(nick) = st.room.members().get(&signed.by).cloned() else {
+            return;
+        };
+        st.seen.insert(signed.id(), Instant::now());
         match event {
             Event::Chat { text, .. } if signed.by != self.me => say!("<{nick}> {text}"),
             Event::Heartbeat {
@@ -306,10 +340,12 @@ impl Node {
 
     fn member(st: &State, who: &str) -> Result<PeerId> {
         let members = st.room.members();
-        let found = members
+        let mut found = members
             .iter()
-            .find(|(p, n)| *n == who || p.to_string() == who);
-        Ok(*found.context("no such member")?.0)
+            .filter(|(p, n)| *n == who || p.to_string() == who);
+        let peer = *found.next().context("no such member")?.0;
+        ensure!(found.next().is_none(), "several members match; use the peer id");
+        Ok(peer)
     }
 
     /// Toggles `who` in a local peer set; returns whether it's now in.
@@ -324,7 +360,14 @@ impl Node {
 
     fn admit(self: &Arc<Self>, peer: PeerId, join: Signed) -> Result<Msg> {
         ensure!(join.by == peer, "join must be signed by the joiner");
-        self.lock().room.admit(&join)?;
+        {
+            let st = self.lock();
+            // Already admitted (our earlier reply was lost): just resend the sync.
+            if st.room.events.contains_key(&join.id()) && st.room.is_member(&peer) {
+                return Ok(self.sync_msg(&st));
+            }
+            st.room.admit(&join)?;
+        }
         self.merge(Some(peer), vec![join], vec![]);
         Ok(self.sync_msg(&self.lock()))
     }
@@ -336,7 +379,12 @@ impl Node {
                 reason: reason.into(),
             })
         };
-        let reply = match read(&mut stream).await? {
+        // Non-members only get to send a Join, so they get a small buffer.
+        let cap = if member { MAX_MSG } else { 64 << 10 };
+        let reply = match tokio::time::timeout(Duration::from_secs(30), read(&mut stream, cap))
+            .await
+            .context("read timed out")??
+        {
             Some(Msg::Join { join }) => {
                 Some(self.admit(peer, join).unwrap_or_else(|e| Msg::Denied {
                     reason: format!("{e:#}"),
@@ -399,7 +447,7 @@ impl Node {
                     room: room_id,
                     invitee,
                     uses,
-                    expires: now() + hours * 3600,
+                    expires: now().saturating_add(hours.saturating_mul(3600)),
                     nonce: nonce(),
                 };
                 let invite = Signed::new(&self.key, &invite)?;
@@ -551,7 +599,11 @@ pub async fn run(
         path,
         control,
         cmds,
-        http: reqwest::Client::new(),
+        // read_timeout counts silence only; long because non-streaming completions say nothing until done.
+        http: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(600))
+            .build()?,
         state: Mutex::new(State {
             room,
             online,
@@ -680,7 +732,7 @@ pub async fn join(
     for (p, addrs) in &bootstrap {
         let _ = wire.cmds.send(Cmd::Dial(*p, addrs.clone()));
     }
-    let room = tokio::time::timeout(Duration::from_secs(60), async {
+    let mut room = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             match wire.events.recv().await.context("network stopped")? {
                 Net::Up(p) => {
@@ -722,5 +774,12 @@ pub async fn join(
     .await
     .context("no member reachable from the ticket")??;
     let path = rooms.join(format!("{}.json", room.id));
+    // Rejoining keeps our local settings (shares, pins, blocks, tokens).
+    if let Some(old) = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Room>(&b).ok())
+    {
+        room.local = old.local;
+    }
     run(key, path, room, wire, api, mode).await
 }

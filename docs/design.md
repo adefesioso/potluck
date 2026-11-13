@@ -5,7 +5,7 @@ IRC for AI: rooms where people chat and share local models; the router finds mem
 ## Principles
 
 - **Rooms are the trust boundary.** Members trust each other; only members see chat, models, or traffic.
-- **No server required.** Peer-to-peer; any member can relay.
+- **No server required.** Peer-to-peer; a `potluck relay` on a reachable host helps peers behind NAT.
 - **Owners stay in control.** Whoever shares a GPU sets its limits and can stop at any time.
 - **Built for small rooms.** 2-30 people; every mechanism is sized for that.
 
@@ -17,17 +17,17 @@ IRC for AI: rooms where people chat and share local models; the router finds mem
 | Room | ID = hash(genesis). Genesis names the owner key. Has a member set, chat, and shares. |
 | Member set | grow-only set of signed events, merged by union, order-free. Members = owner + joins carrying an owner-signed invite, minus joins named by a `remove`. |
 | Invite | owner-signed `{room_id, invitee_key?, uses, expiry}` plus bootstrap addresses, shared as a ticket string. Not published; it travels inside the joins that use it. |
-| Join | invitee-signed `{invite, nick}`. The admitting member checks expiry, `uses`, and `revoke`, and refuses removed keys unless the invite names them. Concurrent admissions may overshoot `uses`; the owner removes extras. |
+| Join | invitee-signed `{invite, nick}`. The nick must be 1-32 letters, digits, `-`, `_`, `.` and not used by a current member (ignoring case); the owner's `create --nick` follows the same rule. The admitting member checks expiry, `uses`, and `revoke`, and refuses removed keys unless the invite names them. Concurrent admissions may overshoot `uses`; the owner removes extras. |
 | Remove | owner-signed `{join_id}`. Members drop the removed key's connections and refuse its streams. |
-| Share | provider-local config `{model, backend, max_concurrent, rate_per_min, max_tokens}`. `model` is the backend's model name (`llama3.1:70b-q4_K_M`). |
-| Heartbeat | member-signed `{ts, models, busy}` flooded like chat every 15s while sharing and on every change; latest `ts` wins; silent for 45s = offline. |
+| Share | provider-local config `{model, backend, max_concurrent, per_min, max_tokens}`. `model` is the backend's model name (`llama3.1:70b-q4_K_M`). |
+| Heartbeat | member-signed `{ts, models, busy}` flooded like chat every 15s while sharing and at once when a model is shared or unshared (busy counts refresh at the next tick); latest `ts` wins; silent for 45s = offline. |
 
 Ceiling: losing the owner key freezes membership; members start a new room.
 
 ## Flow
 
 ```
-owner /invite bob ──► invite link ──► bob dials bootstrap peers, signs join, members accept
+owner /invite ──► ticket (invite.txt) ──► bob dials bootstrap peers, signs join, members accept
 bob: /ask llama3.1:70b "explain this diff"
   bob's router ──► picks carol (online, shares the model, least busy)
   bob ══Noise══ [relay if NAT] ══ carol's node ──► localhost llama.cpp
@@ -38,7 +38,7 @@ bob: /ask llama3.1:70b "explain this diff"
 
 | Job | How |
 |---|---|
-| Connectivity | rust-libp2p: QUIC/TCP, AutoNAT, DCUtR hole punching, circuit relay v2 through members |
+| Connectivity | rust-libp2p: QUIC/TCP, DCUtR hole punching, circuit relay v2 through a `potluck relay` |
 | Membership | exchange member-set events and addresses on connect and on change; union and recompute |
 | Chat | send to connected members; each member forwards new messages to its other members, deduplicated by message hash |
 | Resolution | model name → members whose heartbeat lists it |
