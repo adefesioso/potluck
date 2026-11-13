@@ -2,26 +2,32 @@
 
 ## Stack
 
-- Rust 1.88+, Linux and macOS only: rust-libp2p (TCP/QUIC, Noise, Yamux, relay, DCUtR), tokio, axum (endpoint), ratatui (TUI).
-- JSON wire messages and per-room JSON files ([protocol.md](protocol.md)).
-- Inference backends: any OpenAI-compatible HTTP server (llama.cpp server, vLLM, Ollama, LM Studio).
+Potluck is written in Rust 1.88 or newer and builds on Linux and macOS only. Networking is rust-libp2p with TCP and QUIC transports, Noise, Yamux, circuit relay and DCUtR. The runtime is tokio, the local endpoint is axum, and the TUI is ratatui.
+
+Wire messages and room files are JSON, as described in [protocol.md](protocol.md).
+
+An inference backend is any HTTP server that speaks the OpenAI chat-completions API, such as llama.cpp server, vLLM, Ollama or LM Studio.
 
 ## Layout
 
 | File | Contents |
 |---|---|
-| `src/main.rs` | CLI: `relay`, `create`, `chat`, `join` |
-| `src/net.rs` | key loading and swarm setup (TCP/QUIC, Noise, Yamux, relay, DCUtR) |
-| `src/room.rs` | signed events, membership, admission checks, tickets |
-| `src/node.rs` | room node: swarm loop, `/potluck/room/1` handlers, chat REPL |
-| `src/node/infer.rs` | provider, router, heartbeats, endpoint |
-| `src/ui.rs` | output sink; line frontend and ratatui TUI |
+| `src/main.rs` | The CLI: `relay`, `create`, `chat` and `join`. |
+| `src/net.rs` | Key loading and swarm setup. |
+| `src/room.rs` | Signed events, membership, admission checks and tickets. |
+| `src/node.rs` | The room node: the swarm loop, the `/potluck/room/1` handlers and the chat commands. |
+| `src/node/infer.rs` | Provider, router, heartbeats and the local endpoint, including `/potluck/ask/1`. |
+| `src/ui.rs` | The output sink and the two frontends, plain lines and the ratatui TUI. |
 
 ## Tests
 
-| Test | Checks |
+`cargo test` runs the unit tests and both integration tests. The integration tests start real nodes on localhost and drive them through the plain-line frontend.
+
+| Test | What it checks |
 |---|---|
-| `tests/phase1.rs` | five members chat; a removed member is locked out |
-| `tests/phase2.rs` | an OpenAI client uses a member's model through the endpoint |
-| `tests/common/mod.rs` | shared harness for the integration tests |
-| `tests/lab.sh` | on a pvelab Proxmox node: two members behind separate NATs join, chat, and share via relay |
+| Unit tests in `src/room.rs` | Invites, joins, removal, nick rules and revocation. |
+| Unit tests in `src/ui.rs` | Input editing, history and TUI rendering. |
+| `tests/phase1.rs` | Five members chat, and a removed member is locked out. |
+| `tests/phase2.rs` | An OpenAI client uses a model another member shares, through the local endpoint. |
+| `tests/common/mod.rs` | The harness the two integration tests share. |
+| `tests/lab.sh` | Run by hand on a pvelab Proxmox node. Two members behind separate NATs join, chat and share through a relay, with `tests/lab-backend.py` standing in for the model. |
