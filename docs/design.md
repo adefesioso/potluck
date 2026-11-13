@@ -1,28 +1,35 @@
 # Design
 
-IRC for AI: rooms where people chat and share local models; the router finds members, punches through NAT, encrypts, and sends each request to a member who can serve it.
+Potluck is IRC for AI. People gather in rooms where they chat and share the models they run locally. The software finds the other members, gets through NAT, encrypts everything, and sends each request to a member who can serve it.
 
 ## Principles
 
-- **Rooms are the trust boundary.** Members trust each other; only members see chat, models, or traffic.
-- **No server required.** Peer-to-peer; a `potluck relay` on a reachable host helps peers behind NAT.
-- **Owners stay in control.** Whoever shares a GPU sets its limits and can stop at any time.
-- **Built for small rooms.** 2-30 people; every mechanism is sized for that.
+- **Rooms are the trust boundary.** Members trust each other, and only members see the room's chat, models or traffic.
+- **No server is required.** Nodes talk peer to peer. A `potluck relay` on a reachable host helps the ones behind NAT, and it only ever sees ciphertext.
+- **Providers stay in control.** Whoever shares a GPU sets its limits and can stop at any time.
+- **Rooms are small.** Every mechanism is sized for 2 to 30 people, which is what lets them stay simple.
 
 ## Concepts
 
-| Concept | Definition |
-|---|---|
-| Identity | ed25519 keypair = libp2p peer ID. Nickname is display only. |
-| Room | ID = hash(genesis). Genesis names the owner key. Has a member set, chat, and shares. |
-| Member set | grow-only set of signed events, merged by union, order-free. Members = owner + joins carrying an owner-signed invite, minus joins named by a `remove`. |
-| Invite | owner-signed `{room_id, invitee_key?, uses, expiry}` plus bootstrap addresses, shared as a ticket string. Not published; it travels inside the joins that use it. |
-| Join | invitee-signed `{invite, nick}`. The nick must be 1-32 letters, digits, `-`, `_`, `.` and not used by a current member (ignoring case); the owner's `create --nick` follows the same rule. The admitting member checks expiry, `uses`, and `revoke`, and refuses removed keys unless the invite names them. Concurrent admissions may overshoot `uses`; the owner removes extras. |
-| Remove | owner-signed `{join_id}`. Members drop the removed key's connections and refuse its streams. |
-| Share | provider-local config `{model, backend, max_concurrent, per_min, max_tokens}`. `model` is the backend's model name (`llama3.1:70b-q4_K_M`). |
-| Heartbeat | member-signed `{ts, models, busy}` flooded like chat every 15s while sharing and at once when a model is shared or unshared (busy counts refresh at the next tick); latest `ts` wins; silent for 45s = offline. |
+**Identity.** A node's identity is an ed25519 keypair, which is also its libp2p peer ID. The nickname is only for display.
 
-Ceiling: losing the owner key freezes membership; members start a new room.
+**Room.** A room starts with a genesis event carrying its name and the owner's nick, signed by the owner. The room's ID is the hash of that event, so the ID alone fixes who the owner is. A room has a member set, chat, and shares.
+
+**Member set.** Membership is a grow-only set of signed events. Members merge each other's sets by union, and the order in which events arrive does not matter. The members are the owner, plus everyone whose join carries an invite signed by the owner, minus every join named by a remove.
+
+**Invite.** An invite is signed by the owner and states the room, how many times it can be used, when it expires, and optionally the one key allowed to use it. It is handed over as a ticket string that also carries addresses of current members to dial. An invite is not published to the room; it travels inside the joins that use it.
+
+**Join.** A join is signed by the invitee and carries the invite and a nick. The nick must be 1 to 32 letters, digits, `-`, `_` or `.`, and must not be in use by a current member, ignoring case. The member who admits the join checks that the invite has not expired, been used up, or been revoked. A key that has joined before needs an invite that names it, so a removed member cannot return on a general invite. Two members admitting at the same moment can let in more people than the invite allows, and the owner removes the extras.
+
+**Revoke.** A revoke is signed by the owner and names an invite, which then admits no one else.
+
+**Remove.** A remove is signed by the owner and names a join. Members drop the removed key's connections and refuse its streams.
+
+**Share.** A share is a provider's local setting and never leaves their node: a model, the backend URL that serves it, a concurrency limit, a per-member rate limit, and an optional token cap. The model is whatever name the backend uses, such as `llama3.1:70b-q4_K_M`.
+
+**Heartbeat.** A provider signs a heartbeat listing its shared models and how many requests it is running. Heartbeats spread through the room like chat, every 15 seconds while the node shares anything and at once when a model is shared or unshared. The newest one wins, and a provider that has been silent for 45 seconds counts as offline.
+
+One hard limit follows from this design: only the owner key can invite and remove. If it is lost, membership freezes and the members have to start a new room.
 
 ## Flow
 
@@ -36,17 +43,18 @@ bob: /ask llama3.1:70b "explain this diff"
 
 ## Router
 
-| Job | How |
-|---|---|
-| Connectivity | rust-libp2p: QUIC/TCP, DCUtR hole punching, circuit relay v2 through a `potluck relay` |
-| Membership | exchange member-set events and addresses on connect and on change; union and recompute |
-| Chat | send to connected members; each member forwards new messages to its other members, deduplicated by message hash |
-| Resolution | model name → members whose heartbeat lists it |
-| Selection | pinned members first, then least busy per last heartbeat; on busy, refusal, or unreachable, try the next provider |
-| History | none: members see messages while online |
+**Connectivity.** Nodes use rust-libp2p over QUIC and TCP. Peers behind NAT listen through circuit relay v2 on a `potluck relay`, and DCUtR hole punching upgrades those circuits to direct paths where it can.
 
-## Owner controls
+**Membership.** Members exchange their event sets and known addresses whenever they connect and whenever something changes. Each side takes the union and recomputes who is in the room.
 
-- Per-share limits: concurrency, per-member requests per minute, max tokens per request.
-- Local request log `{ts, member, model, status}` and per-member `/block`, so owners see and control who uses their GPU.
-- `/unshare` takes effect immediately: new requests are refused, in-flight streams end with an error event.
+**Chat.** A message goes to every connected member, and each member forwards messages it has not seen to its other connected members. Duplicates are recognised by the message's hash. There is no history, so members see only what is sent while they are online.
+
+**Resolution and selection.** A model name resolves to the connected members whose latest heartbeat lists it. Pinned members are tried first, then the least busy according to their heartbeats. If a provider is busy, refuses, or cannot be reached, the router moves on to the next. A model you share yourself is answered by your own backend first.
+
+## Provider controls
+
+A provider sets three limits on each share: how many requests run at once, how many requests each member may make per minute, and the most tokens a single request may ask for.
+
+Every request a provider serves is written to a local log with the time, member, model and status. Together with a per-member `/block`, this lets providers see and decide who uses their GPU.
+
+`/unshare` takes effect immediately. New requests are refused and streams in flight end with an error event.
